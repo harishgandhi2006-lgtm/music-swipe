@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchNextTrack, postInteraction } from './api.js';
+import { fetchNextTrack, fetchHistory, postInteraction, postUndo } from './api.js';
 import { useAudio } from './hooks/useAudio.js';
 import CardStack from './components/CardStack.jsx';
 import AudioPlayer from './components/AudioPlayer.jsx';
 import Controls from './components/Controls.jsx';
 import FeedbackToast from './components/FeedbackToast.jsx';
+import LibraryView from './components/LibraryView.jsx';
 
 export default function App() {
+  const [mainTab, setMainTab] = useState('discover');
+  const [history, setHistory] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [nextTrack, setNextTrack] = useState(null);
+  const [pastStack, setPastStack] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [toast, setToast] = useState(null);
   const [needsGesture, setNeedsGesture] = useState(false);
-  const [swipeCount, setSwipeCount] = useState(0);
 
   const swipeRef = useRef({});
   const audio = useAudio(currentTrack);
@@ -23,7 +26,7 @@ export default function App() {
       return await fetchNextTrack();
     } catch (err) {
       if (err.message === 'rate_limited' && retries > 0) {
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, 5000));
         return loadTrack(retries - 1);
       }
       console.error('Failed to load track:', err);
@@ -32,47 +35,85 @@ export default function App() {
     }
   }, []);
 
-  // Initial load — sequential to avoid hitting Deezer rate limit on startup
   useEffect(() => {
     (async () => {
       setIsLoading(true);
+      try {
+        const hist = await fetchHistory();
+        setHistory(hist);
+      } catch (e) {
+        console.error(e);
+      }
       const first = await loadTrack();
       setCurrentTrack(first);
       setIsLoading(false);
       const second = await loadTrack();
       setNextTrack(second);
     })();
-  }, []); // eslint-disable-line
+  }, [loadTrack]);
+
+  useEffect(() => {
+    if (mainTab === 'discover') return;
+    fetchHistory()
+      .then(setHistory)
+      .catch(console.error);
+  }, [mainTab]);
 
   const showToast = useCallback((action) => {
     setToast(action);
     setTimeout(() => setToast(null), 1200);
   }, []);
 
-  const handleSwipe = useCallback(async (action) => {
-    if (!currentTrack) return;
+  const handleSwipe = useCallback(
+    async (action) => {
+      if (!currentTrack) return;
 
-    showToast(action);
-    setSwipeCount(c => c + 1);
+      showToast(action);
 
-    // Save interaction (fire and forget)
-    postInteraction(currentTrack.id, action).catch(console.error);
+      setPastStack((p) => [...p, { prev: currentTrack, prevNext: nextTrack }]);
 
-    // Promote next → current
-    setCurrentTrack(nextTrack);
-    setNextTrack(null);
+      postInteraction(currentTrack.id, action)
+        .then(() => fetchHistory())
+        .then(setHistory)
+        .catch(console.error);
 
-    // Fetch the next-next track in background
-    loadTrack().then(setNextTrack);
-  }, [currentTrack, nextTrack, showToast, loadTrack]);
+      setCurrentTrack(nextTrack);
+      setNextTrack(null);
+      loadTrack().then(setNextTrack);
+    },
+    [currentTrack, nextTrack, showToast, loadTrack],
+  );
 
-  const handleButtonSwipe = useCallback((action) => {
-    if (swipeRef.current?.triggerSwipe) {
-      swipeRef.current.triggerSwipe(action);
-    } else {
-      handleSwipe(action);
+  const handleRewind = useCallback(async () => {
+    if (pastStack.length === 0) return;
+    const top = pastStack[pastStack.length - 1];
+    try {
+      await postUndo();
+      setPastStack((p) => p.slice(0, -1));
+      setCurrentTrack(top.prev);
+      setNextTrack(top.prevNext ?? null);
+      if (!top.prevNext) {
+        loadTrack().then(setNextTrack);
+      }
+      const h = await fetchHistory();
+      setHistory(h);
+    } catch (e) {
+      console.error(e);
+      setToast('undo_fail');
+      setTimeout(() => setToast(null), 1600);
     }
-  }, [handleSwipe]);
+  }, [pastStack, loadTrack]);
+
+  const handleButtonSwipe = useCallback(
+    (action) => {
+      if (swipeRef.current?.triggerSwipe) {
+        swipeRef.current.triggerSwipe(action);
+      } else {
+        handleSwipe(action);
+      }
+    },
+    [handleSwipe],
+  );
 
   const handleFirstGesture = useCallback(() => {
     setNeedsGesture(false);
@@ -103,64 +144,97 @@ export default function App() {
     );
   }
 
+  const rated = history.length;
+  const subtitle =
+    rated === 0
+      ? 'Swipe to explore music'
+      : `Welcome back — ${rated} song${rated !== 1 ? 's' : ''} rated`;
+
   return (
     <div className="flex flex-col h-screen max-w-sm mx-auto px-4 py-6 gap-4 select-none">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-white font-bold text-xl tracking-tight">Discover</h1>
-          <p className="text-white/40 text-xs mt-0.5">
-            {swipeCount === 0
-              ? 'Swipe to explore music'
-              : `${swipeCount} song${swipeCount !== 1 ? 's' : ''} explored`}
-          </p>
+      <div className="flex items-start justify-between gap-2 shrink-0">
+        <div className="min-w-0">
+          <h1 className="text-white font-bold text-xl tracking-tight">Music Swipe</h1>
+          <p className="text-white/40 text-xs mt-0.5 truncate">{subtitle}</p>
         </div>
-        <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-sm">
+        <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-sm shrink-0">
           🎵
         </div>
       </div>
 
-      {/* Card area */}
-      <div className="flex-1 relative" style={{ minHeight: 0 }}>
-        {needsGesture && (
+      <div className="flex rounded-xl bg-white/10 p-0.5 shrink-0">
+        {[
+          { id: 'discover', label: 'Discover' },
+          { id: 'liked', label: 'Liked' },
+          { id: 'history', label: 'History' },
+        ].map((t) => (
           <button
-            className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 rounded-3xl backdrop-blur-sm gap-3"
-            onClick={handleFirstGesture}
+            key={t.id}
+            type="button"
+            onClick={() => setMainTab(t.id)}
+            className={`flex-1 py-2 text-xs font-semibold rounded-lg transition ${
+              mainTab === t.id ? 'bg-white/20 text-white' : 'text-white/50 hover:text-white/70'
+            }`}
           >
-            <div className="text-4xl animate-bounce">▶</div>
-            <p className="text-white/80 text-sm font-medium">Tap to start playing</p>
+            {t.label}
           </button>
-        )}
-        {currentTrack ? (
-          <CardStack
-            currentTrack={currentTrack}
-            nextTrack={nextTrack}
-            onSwipe={handleSwipe}
-            swipeRef={swipeRef.current}
-          />
-        ) : (
-          <div className="flex flex-col items-center justify-center h-full gap-3 text-white/40">
-            <div className="text-4xl">🎧</div>
-            <p className="text-sm">No more tracks right now</p>
-          </div>
-        )}
+        ))}
       </div>
 
-      {/* Audio player */}
-      <AudioPlayer audio={audio} onNeedsGesture={() => setNeedsGesture(true)} />
+      {mainTab === 'discover' && (
+        <>
+          <div className="flex-1 relative" style={{ minHeight: 0 }}>
+            {needsGesture && (
+              <button
+                className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 rounded-3xl backdrop-blur-sm gap-3"
+                onClick={handleFirstGesture}
+              >
+                <div className="text-4xl animate-bounce">▶</div>
+                <p className="text-white/80 text-sm font-medium">Tap to start playing</p>
+              </button>
+            )}
+            {currentTrack ? (
+              <CardStack
+                currentTrack={currentTrack}
+                nextTrack={nextTrack}
+                onSwipe={handleSwipe}
+                swipeRef={swipeRef.current}
+              />
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full gap-3 text-white/40">
+                <div className="text-4xl">🎧</div>
+                <p className="text-sm">No more tracks right now</p>
+              </div>
+            )}
+          </div>
 
-      {/* Controls */}
-      <Controls
-        isPlaying={audio.isPlaying}
-        onTogglePlay={audio.toggle}
-        onSwipe={handleButtonSwipe}
-      />
+          <AudioPlayer audio={audio} onNeedsGesture={() => setNeedsGesture(true)} />
 
-      {/* Swipe hint */}
-      {swipeCount === 0 && !needsGesture && (
-        <p className="text-center text-white/25 text-xs pb-2">
-          ← drag to pass  ·  drag to like →
-        </p>
+          <Controls
+            isPlaying={audio.isPlaying}
+            onTogglePlay={audio.toggle}
+            onSwipe={handleButtonSwipe}
+            onRewind={handleRewind}
+            canRewind={pastStack.length > 0}
+          />
+
+          {rated === 0 && !needsGesture && (
+            <p className="text-center text-white/25 text-xs pb-2">
+              ← drag to pass · drag to like →
+            </p>
+          )}
+        </>
+      )}
+
+      {mainTab === 'liked' && (
+        <div className="flex-1 flex flex-col min-h-0">
+          <LibraryView history={history} mode="liked" />
+        </div>
+      )}
+      {mainTab === 'history' && (
+        <div className="flex-1 flex flex-col min-h-0">
+          <LibraryView history={history} mode="history" />
+        </div>
       )}
 
       <FeedbackToast message={toast} />

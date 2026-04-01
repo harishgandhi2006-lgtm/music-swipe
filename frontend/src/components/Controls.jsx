@@ -1,6 +1,6 @@
-export default function Controls({ isPlaying, onTogglePlay, onSwipe }) {
+export default function Controls({ isPlaying, onTogglePlay, onSwipe, onRewind, canRewind }) {
   return (
-    <div className="flex items-center justify-center gap-6 py-2">
+    <div className="flex items-center justify-center gap-4 py-2 flex-wrap">
       {/* Reject button */}
       <button
         onClick={() => onSwipe('reject')}
@@ -9,6 +9,18 @@ export default function Controls({ isPlaying, onTogglePlay, onSwipe }) {
       >
         ✕
       </button>
+
+      {onRewind != null && (
+        <button
+          type="button"
+          onClick={onRewind}
+          disabled={!canRewind}
+          className="w-12 h-12 rounded-full bg-white/10 border border-white/20 text-white/80 text-lg flex items-center justify-center hover:bg-white/20 disabled:opacity-25 disabled:pointer-events-none active:scale-95 transition-all"
+          aria-label="Rewind last swipe"
+        >
+          ↩
+        </button>
+      )}
 
       {/* Play/Pause button */}
       <button

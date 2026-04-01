@@ -26,6 +26,14 @@ router.get('/history', (req, res) => {
   res.json(db.getHistory(userId, 100));
 });
 
+router.post('/undo', (req, res) => {
+  const userId = req.headers['x-user-id'] || 'default';
+  const removed = db.removeLastInteraction(userId);
+  if (!removed) return res.status(400).json({ error: 'No interaction to undo' });
+  updateAffinityScores(userId, removed.track_id);
+  res.json({ ok: true, removed });
+});
+
 router.get('/genres', (req, res) => {
   const userId = req.headers['x-user-id'] || 'default';
   res.json(db.getGenreScores(userId));

@@ -37,3 +37,12 @@ export async function fetchGenreScores() {
   if (!res.ok) throw new Error(`Failed to fetch genre scores: ${res.status}`);
   return res.json();
 }
+
+export async function postUndo() {
+  const res = await fetch(`${BASE}/interactions/undo`, {
+    method: 'POST',
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(`Failed to undo: ${res.status}`);
+  return res.json();
+}

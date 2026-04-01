@@ -5,6 +5,14 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = join(__dirname, 'music_swipe.json');
 
+const AFFINITY_PRIOR = 2;
+const REJECT_WEIGHT = 0.55;
+
+function smoothedAffinityScore(likes, rejects) {
+  const denom = likes + rejects * REJECT_WEIGHT + 2 * AFFINITY_PRIOR;
+  return (likes + AFFINITY_PRIOR) / denom;
+}
+
 function loadDB() {
   if (!existsSync(DB_PATH)) {
     return { tracks: {}, interactions: [], genre_scores: {}, artist_scores: {}, _nextId: 1 };
@@ -13,6 +21,12 @@ function loadDB() {
   if (!data.artist_scores) data.artist_scores = {};
   // Migrate old interactions that lack user_id
   data.interactions = data.interactions.map(i => ({ user_id: 'default', ...i }));
+  for (const g of Object.values(data.genre_scores)) {
+    g.score = smoothedAffinityScore(g.likes, g.rejects);
+  }
+  for (const a of Object.values(data.artist_scores)) {
+    a.score = smoothedAffinityScore(a.likes, a.rejects);
+  }
   return data;
 }
 
@@ -62,15 +76,30 @@ const db = {
       .slice(0, limit)
       .map(i => {
         const t = _db.tracks[i.track_id] || {};
-        return { id: i.id, action: i.action, created_at: i.created_at,
+        const raw = t.preview_url || '';
+        const preview_url = raw
+          ? `/api/proxy/audio?url=${encodeURIComponent(raw)}`
+          : null;
+        return {
+          id: i.id, action: i.action, created_at: i.created_at,
           track_id: i.track_id, title: t.title, artist_name: t.artist_name,
-          cover_url: t.cover_url, genre_name: t.genre_name };
+          cover_url: t.cover_url, genre_name: t.genre_name, preview_url,
+        };
       });
+  },
+
+  removeLastInteraction(userId) {
+    const list = this.userInteractions(userId);
+    if (list.length === 0) return null;
+    const last = list[list.length - 1];
+    _db.interactions = _db.interactions.filter(i => i.id !== last.id);
+    saveDB(_db);
+    return last;
   },
 
   // ── genre scores (per user) ───────────────────────────────────────────────
   upsertGenreScore(userId, genre_id, genre_name, likes, rejects) {
-    const score = likes / (likes + rejects + 1);
+    const score = smoothedAffinityScore(likes, rejects);
     _db.genre_scores[key(userId, genre_id)] = { userId, genre_id, genre_name, likes, rejects, score, updated_at: Date.now() };
     saveDB(_db);
   },
@@ -80,7 +109,7 @@ const db = {
   getGenreScores(userId) {
     return Object.values(_db.genre_scores).filter(g => g.userId === userId).sort((a, b) => b.score - a.score);
   },
-  getTopGenres(userId, minScore = 0.3, limit = 5) {
+  getTopGenres(userId, minScore = 0.34, limit = 8) {
     return Object.values(_db.genre_scores)
       .filter(g => g.userId === userId && g.score > minScore && g.likes > 0)
       .sort((a, b) => b.score - a.score).slice(0, limit);
@@ -96,7 +125,7 @@ const db = {
 
   // ── artist scores (per user) ──────────────────────────────────────────────
   upsertArtistScore(userId, artist_id, artist_name, likes, rejects) {
-    const score = likes / (likes + rejects + 1);
+    const score = smoothedAffinityScore(likes, rejects);
     _db.artist_scores[key(userId, artist_id)] = { userId, artist_id, artist_name, likes, rejects, score, updated_at: Date.now() };
     saveDB(_db);
   },
@@ -106,7 +135,7 @@ const db = {
   getArtistScores(userId) {
     return Object.values(_db.artist_scores).filter(a => a.userId === userId).sort((a, b) => b.score - a.score);
   },
-  getTopArtists(userId, minScore = 0.4, limit = 5) {
+  getTopArtists(userId, minScore = 0.38, limit = 5) {
     return Object.values(_db.artist_scores)
       .filter(a => a.userId === userId && a.score > minScore && a.likes > 0)
       .sort((a, b) => b.score - a.score).slice(0, limit);

@@ -4,7 +4,8 @@ import { getChart, searchTracks, getAlbum, getArtistTop, getTrackRadio, getRelat
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const COLD_START_THRESHOLD = 5;
-const EPSILON = 0.20;
+const EPSILON = 0.26;
+const CHART_DIVERSITY = 0.12; // extra chart pulls so one genre does not own the feed
 const POOL_TARGET = 12;   // keep this many tracks ready per user
 const POOL_MIN    = 4;    // refill when below this
 const QUOTA_RETRY_MS = 8000; // wait before retrying after quota error
@@ -55,6 +56,21 @@ function durationScore(userId, duration) {
 }
 function popularityScore(rank) {
   return Math.min(rank / 1_000_000, 1);
+}
+
+/** Sample index with softmax over scores; higher temperature = flatter distribution. */
+function softmaxPickIndex(scores, temperature) {
+  if (scores.length === 0) return -1;
+  const t = Math.max(temperature, 0.05);
+  const maxS = Math.max(...scores);
+  const weights = scores.map(s => Math.exp((s - maxS) / t));
+  const sum = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * sum;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return i;
+  }
+  return scores.length - 1;
 }
 
 // ── Genre enrichment (1 API call, cached) ─────────────────────────────────────
@@ -135,7 +151,7 @@ async function strategyTrackRadio(userId, excluded) {
 }
 
 async function strategyArtist(userId, excluded) {
-  const topArtists = db.getTopArtists(userId, 0.4, 5);
+  const topArtists = db.getTopArtists(userId, 0.38, 5);
   if (topArtists.length === 0) return null;
   const total = topArtists.reduce((s, a) => s + a.score, 0);
   let rand = Math.random() * total;
@@ -151,12 +167,29 @@ async function strategyArtist(userId, excluded) {
 }
 
 async function strategyGenre(userId, excluded) {
-  const topGenres = db.getTopGenres(userId, 0.3, 5);
-  if (topGenres.length === 0) return null;
-  const total = topGenres.reduce((s, g) => s + g.score, 0);
-  let rand = Math.random() * total;
-  let chosen = topGenres[0];
-  for (const g of topGenres) { rand -= g.score; if (rand <= 0) { chosen = g; break; } }
+  const topGenres = db.getTopGenres(userId, 0.34, 6);
+  const runners = db.getGenreScores(userId)
+    .filter(g => g.likes > 0 && !topGenres.some(t => t.genre_id === g.genre_id))
+    .slice(0, 3);
+  let pool = [...topGenres, ...runners];
+  if (pool.length === 0) return null;
+
+  if (pool.length === 1 && pool[0].genre_name) {
+    const extras = EXPLORATION_GENRES.filter(n => n !== pool[0].genre_name)
+      .sort(() => Math.random() - 0.5)
+      .slice(0, 2)
+      .map(genre_name => ({ genre_name, genre_id: null, score: 0.36, likes: 0 }));
+    pool = [...pool, ...extras];
+  }
+
+  const weights = pool.map(g => {
+    let w = g.score;
+    if (g.likes > 0 && g.likes < 3) w *= 0.88;
+    return w;
+  });
+  const idx = softmaxPickIndex(weights, 1.12);
+  const chosen = pool[idx];
+  if (!chosen?.genre_name) return null;
   const offset = Math.floor(Math.random() * 80);
   return pickBest(userId, await searchTracks(chosen.genre_name, 100, offset), excluded);
 }
@@ -193,8 +226,13 @@ async function fetchOneTrack(userId) {
     if (t) return t;
   }
 
+  if (Math.random() < CHART_DIVERSITY) {
+    const chartTrack = await strategyChart(userId, excluded).catch(e => { if (e.isQuota) throw e; return null; });
+    if (chartTrack) return chartTrack;
+  }
+
   const likedCount  = db.getRecentlyLikedTrackIds(userId, 1).length;
-  const artistCount = db.getTopArtists(userId, 0.4, 1).length;
+  const artistCount = db.getTopArtists(userId, 0.38, 1).length;
   const roll = Math.random();
 
   const ordered = [];
