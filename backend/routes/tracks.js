@@ -1,12 +1,26 @@
 import { Router } from 'express';
-import { getNextTrack } from '../services/recommender.js';
+import { getNextTrack, getFilteredTrack } from '../services/recommender.js';
 
 const router = Router();
 
 router.get('/next', async (req, res) => {
   const userId = req.headers['x-user-id'] || 'default';
+  const { filter_type, filter_id, filter_name } = req.query;
+
   try {
-    const track = await getNextTrack(userId);
+    let track;
+
+    if (filter_type) {
+      const filter = {
+        type: filter_type,
+        id:   filter_id ? Number(filter_id) : null,
+        name: filter_name || null,
+      };
+      track = await getFilteredTrack(userId, filter);
+    } else {
+      track = await getNextTrack(userId);
+    }
+
     if (!track) return res.status(503).json({ error: 'No tracks available right now' });
 
     res.json({

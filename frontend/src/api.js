@@ -9,10 +9,23 @@ function headers() {
   };
 }
 
-export async function fetchNextTrack() {
-  const res = await fetch(`${BASE}/tracks/next`, { headers: headers() });
+export async function fetchNextTrack(filter = null) {
+  const params = new URLSearchParams();
+  if (filter) {
+    params.set('filter_type', filter.type);
+    if (filter.id)   params.set('filter_id',   filter.id);
+    if (filter.name) params.set('filter_name', filter.name);
+  }
+  const qs  = params.toString();
+  const res = await fetch(`${BASE}/tracks/next${qs ? '?' + qs : ''}`, { headers: headers() });
   if (res.status === 429) throw new Error('rate_limited');
   if (!res.ok) throw new Error(`Failed to fetch track: ${res.status}`);
+  return res.json();
+}
+
+export async function searchMusic(query) {
+  const res = await fetch(`${BASE}/search?q=${encodeURIComponent(query)}`, { headers: headers() });
+  if (!res.ok) throw new Error(`Search failed: ${res.status}`);
   return res.json();
 }
 

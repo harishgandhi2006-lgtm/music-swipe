@@ -303,6 +303,37 @@ export async function getNextTrack(userId = 'default') {
   return fetchOneTrack(userId);
 }
 
+// ── Filtered mode (genre / artist / similar-song) ────────────────────────────
+
+export async function getFilteredTrack(userId, filter) {
+  // In filter mode we only exclude swiped tracks, not the main pool
+  const excluded = db.getSeenTrackIds(userId);
+
+  if (filter.type === 'genre') {
+    const offset = Math.floor(Math.random() * 80);
+    const tracks = await searchTracks(filter.name, 100, offset);
+    return pickBest(userId, tracks, excluded);
+  }
+
+  if (filter.type === 'artist') {
+    // 40% chance: pull from a related artist to keep it fresh
+    let artistId = filter.id;
+    if (Math.random() > 0.6) {
+      const related = await getRelatedArtists(artistId, 10).catch(() => []);
+      if (related.length > 0) artistId = related[Math.floor(Math.random() * related.length)].id;
+    }
+    const tracks = await getArtistTop(artistId, 50).catch(() => []);
+    return pickBest(userId, tracks, excluded);
+  }
+
+  if (filter.type === 'song') {
+    const radio = await getTrackRadio(filter.id, 25).catch(() => []);
+    return pickBest(userId, radio, excluded);
+  }
+
+  return null;
+}
+
 // Warm up the pool for a user in the background (call at startup or first visit)
 export function warmPool(userId = 'default') {
   const pool = getPool(userId);

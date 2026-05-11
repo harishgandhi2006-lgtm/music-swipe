@@ -6,6 +6,7 @@ import { dirname, join } from 'path';
 import tracksRouter from './routes/tracks.js';
 import interactionsRouter from './routes/interactions.js';
 import proxyRouter from './routes/proxy.js';
+import searchRouter from './routes/search.js';
 import { warmPool } from './services/recommender.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,7 @@ app.use(express.json());
 app.use('/api/tracks', tracksRouter);
 app.use('/api/interactions', interactionsRouter);
 app.use('/api/proxy', proxyRouter);
+app.use('/api/search', searchRouter);
 
 // Serve frontend build in production
 const frontendDist = join(__dirname, '../frontend/dist');

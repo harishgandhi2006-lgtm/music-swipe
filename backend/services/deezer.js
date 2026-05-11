@@ -54,3 +54,9 @@ export async function getRelatedArtists(artistId, limit = 10) {
   const data = await deezerGet(`/artist/${artistId}/related?limit=${limit}`);
   return data.data || [];
 }
+
+export async function searchArtists(query, limit = 8) {
+  const q = encodeURIComponent(query);
+  const data = await deezerGet(`/search/artist?q=${q}&limit=${limit}`);
+  return data.data || [];
+}
