@@ -1,13 +1,15 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import SwipeCard from './SwipeCard.jsx';
 
-export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef }) {
+export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef, onShare }) {
   return (
     <div className="relative w-full h-full">
       {/* Back card (next track preview) */}
       {nextTrack && (
-        <div className="absolute inset-0 rounded-3xl overflow-hidden"
-          style={{ transform: 'scale(0.94) translateY(12px)', opacity: 0.5 }}>
+        <div
+          className="absolute inset-0 rounded-3xl overflow-hidden"
+          style={{ transform: 'scale(0.94) translateY(12px)', opacity: 0.5 }}
+        >
           <div
             className="absolute inset-0 bg-cover bg-center"
             style={{ backgroundImage: `url(${nextTrack.cover_url})` }}
@@ -30,6 +32,7 @@ export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef }
               track={currentTrack}
               onSwipe={onSwipe}
               audioControls={swipeRef}
+              onShare={onShare}
             />
           </motion.div>
         )}

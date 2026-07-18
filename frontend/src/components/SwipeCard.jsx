@@ -1,11 +1,10 @@
 import { motion } from 'framer-motion';
 import { useSwipe } from '../hooks/useSwipe.js';
 
-export default function SwipeCard({ track, onSwipe, audioControls }) {
+export default function SwipeCard({ track, onSwipe, audioControls, onShare }) {
   const { controls, x, rotate, likeOpacity, rejectOpacity, triggerSwipe, handleDragEnd } =
     useSwipe(onSwipe);
 
-  // Expose triggerSwipe to parent via callback ref
   if (audioControls) audioControls.triggerSwipe = triggerSwipe;
 
   return (
@@ -27,6 +26,21 @@ export default function SwipeCard({ track, onSwipe, audioControls }) {
 
       {/* Gradient overlay */}
       <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent" />
+
+      {/* Share button */}
+      {onShare && (
+        <button
+          onPointerDown={e => e.stopPropagation()}
+          onClick={e => { e.stopPropagation(); onShare(); }}
+          className="absolute top-4 right-4 w-9 h-9 rounded-full bg-black/40 backdrop-blur-sm border border-white/20 flex items-center justify-center text-white hover:bg-black/60 transition z-10"
+          aria-label="Share this track"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      )}
 
       {/* LIKE badge */}
       <motion.div
