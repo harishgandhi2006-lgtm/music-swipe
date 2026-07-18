@@ -9,13 +9,43 @@ const POOL_TARGET = 12;   // keep this many tracks ready per user
 const POOL_MIN    = 4;    // refill when below this
 const QUOTA_RETRY_MS = 8000; // wait before retrying after quota error
 
+// Guarantee an exploration track at least this often. Pure random EPSILON can
+// produce long exploit streaks, which is what a genre loop actually feels like.
+const EXPLORE_EVERY = 4;
+
+// Genre diversity guard: within the last RECENT_WINDOW queued tracks, no single
+// genre may occupy more than MAX_SAME_GENRE slots.
+const RECENT_WINDOW = 5;
+const MAX_SAME_GENRE = 2;
+const MAX_DIVERSITY_SKIPS = 3; // give up rather than stall the pool
+
 const WEIGHTS = { genre: 0.30, artist: 0.30, duration: 0.20, popularity: 0.20 };
 
-const EXPLORATION_GENRES = [
-  'Pop', 'Rock', 'Hip Hop', 'Electronic', 'Jazz', 'R&B', 'Classical',
-  'Country', 'Metal', 'Soul', 'Reggae', 'Blues', 'Folk', 'Latin', 'Dance',
-  'Punk', 'Alternative', 'Indie', 'House', 'Techno', 'Funk', 'Gospel',
-];
+// Grouped so exploration can jump to a *distant* family rather than a
+// neighbouring genre. Liking rap shouldn't make "R&B" the adventurous pick.
+const GENRE_FAMILIES = {
+  urban:      ['Rap/Hip Hop', 'Hip Hop', 'Rap', 'R&B', 'Soul', 'Funk', 'Reggae', 'Dancehall'],
+  rock:       ['Rock', 'Hard Rock', 'Metal', 'Punk', 'Alternative', 'Indie', 'Grunge'],
+  electronic: ['Electronic', 'Dance', 'House', 'Techno', 'EDM', 'Electro', 'Trance'],
+  pop:        ['Pop', 'Dance Pop', 'K-Pop'],
+  acoustic:   ['Folk', 'Country', 'Blues', 'Singer & Songwriter', 'Americana'],
+  refined:    ['Jazz', 'Classical', 'Opera', 'Soundtrack', 'Gospel'],
+  world:      ['Latin', 'World', 'African', 'Asian Music', 'Brazilian', 'Reggaeton', 'Afrobeat'],
+};
+
+const EXPLORATION_GENRES = Object.values(GENRE_FAMILIES).flat();
+
+function familyOf(genreName) {
+  if (!genreName) return null;
+  const lower = genreName.toLowerCase();
+  for (const [family, genres] of Object.entries(GENRE_FAMILIES)) {
+    if (genres.some(g => {
+      const gl = g.toLowerCase();
+      return lower.includes(gl) || gl.includes(lower);
+    })) return family;
+  }
+  return null;
+}
 
 // ── Per-user pool ─────────────────────────────────────────────────────────────
 // Map<userId, { tracks: Track[], ids: Set<number>, refilling: boolean }>
@@ -23,16 +53,36 @@ const pools = new Map();
 
 function getPool(userId) {
   if (!pools.has(userId)) {
-    pools.set(userId, { tracks: [], ids: new Set(), refilling: false });
+    pools.set(userId, {
+      tracks: [],
+      ids: new Set(),
+      refilling: false,
+      recentGenres: [],   // genres of the last RECENT_WINDOW queued tracks
+      sinceExplore: 0,    // tracks queued since the last exploration pick
+    });
   }
   return pools.get(userId);
 }
 
-// All IDs the recommender should not return for this user
-function getAllExcluded(userId) {
+// All IDs the recommender should not return for this user.
+// `skip` holds tracks rejected by the diversity guard during this refill, so we
+// don't fetch the same one over and over.
+function getAllExcluded(userId, skip) {
   const interacted = db.getSeenTrackIds(userId);
   const pooled     = getPool(userId).ids;
-  return new Set([...interacted, ...pooled]);
+  return new Set([...interacted, ...pooled, ...(skip || [])]);
+}
+
+// Would queueing this track make the feed feel repetitive?
+function violatesDiversity(pool, track) {
+  if (!track.genre_name) return false;
+  const sameGenre = pool.recentGenres.filter(g => g === track.genre_name).length;
+  return sameGenre >= MAX_SAME_GENRE;
+}
+
+function noteQueued(pool, track) {
+  pool.recentGenres.push(track.genre_name || null);
+  if (pool.recentGenres.length > RECENT_WINDOW) pool.recentGenres.shift();
 }
 
 // ── Affinity scoring ──────────────────────────────────────────────────────────
@@ -91,23 +141,38 @@ function normalizeTrack(raw, genre_id, genre_name) {
 
 // ── Pick best from candidates (scores WITHOUT enriching all of them) ───────────
 
-async function pickBest(userId, candidates, excluded, topN = 20) {
+async function pickBest(userId, candidates, excluded, opts = {}) {
+  const { mode = 'affinity', topN = 20 } = opts;
+
   const eligible = candidates.filter(t => t.preview && !excluded.has(t.id));
   if (eligible.length === 0) return null;
 
   const scored = eligible.map(t => {
-    const cached   = db.getTrack(t.id);
-    const genre_id = cached?.genre_id ?? null;
-    const s = (
-      WEIGHTS.genre      * genreScore(userId, genre_id) +
-      WEIGHTS.artist     * artistScore(userId, t.artist?.id) +
-      WEIGHTS.duration   * durationScore(userId, t.duration) +
-      WEIGHTS.popularity * popularityScore(t.rank)
-    );
+    let s;
+    if (mode === 'explore') {
+      // Deliberately taste-blind. Ranking exploration candidates by existing
+      // affinity is what collapsed discovery back into the user's current
+      // genre — the whole point here is to escape that gravity. Popularity is
+      // kept at a low weight only so picks stay recognisable rather than
+      // obscure, and randomness dominates.
+      s = 0.25 * popularityScore(t.rank) + 0.75 * Math.random();
+    } else {
+      const cached   = db.getTrack(t.id);
+      const genre_id = cached?.genre_id ?? null;
+      s = (
+        WEIGHTS.genre      * genreScore(userId, genre_id) +
+        WEIGHTS.artist     * artistScore(userId, t.artist?.id) +
+        WEIGHTS.duration   * durationScore(userId, t.duration) +
+        WEIGHTS.popularity * popularityScore(t.rank)
+      );
+    }
     return { t, s };
   }).sort((a, b) => b.s - a.s);
 
-  const pool = scored.slice(0, Math.min(topN, scored.length));
+  // Explore draws from a wider slice so we're not just re-picking the same
+  // handful of "safe" tracks out of an unfamiliar genre.
+  const width = mode === 'explore' ? Math.max(topN, 30) : topN;
+  const pool = scored.slice(0, Math.min(width, scored.length));
   const chosen = pool[Math.floor(Math.random() * pool.length)].t;
 
   // Enrich only the winner (1 API call)
@@ -161,36 +226,80 @@ async function strategyGenre(userId, excluded) {
   return pickBest(userId, await searchTracks(chosen.genre_name, 100, offset), excluded);
 }
 
-async function strategyExplore(userId, excluded) {
-  const touched    = db.getTouchedGenreNames(userId);
-  const unexplored = EXPLORATION_GENRES.filter(g => !touched.has(g));
-  let genreName;
-  if (unexplored.length > 0) {
-    genreName = unexplored[Math.floor(Math.random() * unexplored.length)];
-  } else {
-    const scores = db.getGenreScores(userId);
-    const bottom = scores.slice(-5);
-    genreName = bottom.length > 0
-      ? bottom[Math.floor(Math.random() * bottom.length)].genre_name
-      : EXPLORATION_GENRES[Math.floor(Math.random() * EXPLORATION_GENRES.length)];
+/**
+ * Choose a genre by *distance* from what the user already listens to.
+ * Ranking whole families by engagement (rather than picking any untouched
+ * genre) is what stops "you liked rap, here's some R&B" from counting as
+ * discovery.
+ */
+function pickExplorationGenre(userId) {
+  const scores = db.getGenreScores(userId);
+
+  // Total swipes per family — engagement, not approval. A family the user
+  // rejected is still a family they've been shown plenty of.
+  const engagement = new Map();
+  for (const g of scores) {
+    const fam = familyOf(g.genre_name);
+    if (fam) engagement.set(fam, (engagement.get(fam) || 0) + g.likes + g.rejects);
   }
-  const offset = Math.floor(Math.random() * 50);
-  return pickBest(userId, await searchTracks(genreName, 50, offset), excluded);
+
+  // Inverse-engagement weighted sample across *all* families. Taking the "N
+  // least engaged" instead collapses to the same handful whenever engagement
+  // ties at zero — with a single-genre profile that silently put four of the
+  // seven families permanently out of reach.
+  const families = Object.keys(GENRE_FAMILIES);
+  const weights = families.map(f => 1 / (1 + (engagement.get(f) || 0)));
+  const total = weights.reduce((a, b) => a + b, 0);
+
+  let r = Math.random() * total;
+  let family = families[families.length - 1];
+  for (let i = 0; i < families.length; i++) {
+    r -= weights[i];
+    if (r <= 0) { family = families[i]; break; }
+  }
+
+  const touched = db.getTouchedGenreNames(userId);
+  const fresh = GENRE_FAMILIES[family].filter(g => !touched.has(g));
+  const list = fresh.length > 0 ? fresh : GENRE_FAMILIES[family];
+
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+async function strategyExplore(userId, excluded) {
+  // Try a couple of distant genres before giving up — a single failed search
+  // used to fall straight through to the exploit strategies, which is how the
+  // real exploration rate ended up well under EPSILON.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const genreName = pickExplorationGenre(userId);
+    const offset = Math.floor(Math.random() * 50);
+    const results = await searchTracks(genreName, 50, offset).catch(() => []);
+    const track = await pickBest(userId, results, excluded, { mode: 'explore' });
+    if (track) return track;
+  }
+  return null;
 }
 
 // ── Single track fetch (picks one strategy) ───────────────────────────────────
 
-async function fetchOneTrack(userId) {
-  const excluded = getAllExcluded(userId);
+async function fetchOneTrack(userId, skip) {
+  const pool     = getPool(userId);
+  const excluded = getAllExcluded(userId, skip);
   const total    = db.countInteractions(userId);
 
   if (total < COLD_START_THRESHOLD) {
     return strategyChart(userId, excluded);
   }
 
-  if (Math.random() < EPSILON) {
+  // Explore on the usual EPSILON roll, but also force one whenever we've gone
+  // EXPLORE_EVERY tracks without it. The forced path is what breaks a streak;
+  // random alone can go a long time without firing.
+  const overdue = pool.sinceExplore >= EXPLORE_EVERY;
+  if (overdue || Math.random() < EPSILON) {
     const t = await strategyExplore(userId, excluded).catch(e => { if (e.isQuota) throw e; return null; });
-    if (t) return t;
+    if (t) {
+      pool.sinceExplore = 0;
+      return t;
+    }
   }
 
   const likedCount  = db.getRecentlyLikedTrackIds(userId, 1).length;
@@ -205,7 +314,13 @@ async function fetchOneTrack(userId) {
   for (const strategy of ordered) {
     try {
       const t = await strategy(userId, excluded);
-      if (t) return t;
+      if (t) {
+        // Only exploit strategies advance the counter; strategyExplore appearing
+        // as a fallback here still counts as exploration.
+        if (strategy === strategyExplore) pool.sinceExplore = 0;
+        else pool.sinceExplore++;
+        return t;
+      }
     } catch (err) {
       if (err.isQuota) throw err; // stop immediately on quota
     }
@@ -220,14 +335,28 @@ async function refillPool(userId) {
   if (pool.refilling) return;
   pool.refilling = true;
 
+  const skip = new Set(); // diversity-rejected tracks, this refill only
+  let skips = 0;
+
   while (pool.tracks.length < POOL_TARGET) {
     try {
-      const track = await fetchOneTrack(userId);
+      const track = await fetchOneTrack(userId, skip);
       if (!track) break; // no more unique tracks available right now
-      if (!pool.ids.has(track.id)) {
-        pool.tracks.push(track);
-        pool.ids.add(track.id);
+
+      if (pool.ids.has(track.id)) continue;
+
+      // Too much of this genre lately — put it aside and ask for something
+      // else. Bounded, so a narrow catalogue can't stall the refill.
+      if (violatesDiversity(pool, track) && skips < MAX_DIVERSITY_SKIPS) {
+        skip.add(track.id);
+        skips++;
+        continue;
       }
+      skips = 0;
+
+      pool.tracks.push(track);
+      pool.ids.add(track.id);
+      noteQueued(pool, track);
     } catch (err) {
       if (err.isQuota) {
         console.log(`Quota hit for user ${userId} — pausing pool refill for ${QUOTA_RETRY_MS}ms`);
@@ -260,9 +389,22 @@ export async function getNextTrack(userId = 'default') {
     return track;
   }
 
-  // Pool is empty — fetch one track synchronously (only happens on first load)
+  // Pool is empty — fetch synchronously. This path skipped the diversity guard
+  // entirely, which is how a cold pool could still emit a run of same-genre
+  // tracks despite the cap.
   console.log(`Pool empty for user ${userId}, fetching synchronously`);
-  return fetchOneTrack(userId);
+  const skip = new Set();
+  for (let attempt = 0; attempt <= MAX_DIVERSITY_SKIPS; attempt++) {
+    const track = await fetchOneTrack(userId, skip);
+    if (!track) return null;
+    if (attempt < MAX_DIVERSITY_SKIPS && violatesDiversity(pool, track)) {
+      skip.add(track.id);
+      continue;
+    }
+    noteQueued(pool, track);
+    return track;
+  }
+  return null;
 }
 
 // Warm up the pool for a user in the background (call at startup or first visit)
