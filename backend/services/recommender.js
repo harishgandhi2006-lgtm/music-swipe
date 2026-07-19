@@ -73,17 +73,31 @@ function getAllExcluded(userId, skip) {
   return new Set([...interacted, ...pooled, ...(skip || [])]);
 }
 
+// Deezer often returns no genre for a track. Bucketing those under one label
+// rather than exempting them keeps the cap enforceable: an unlabeled run is
+// still a run, and letting it through was how a cold pool could emit five
+// straight tracks the guard never saw.
+const UNLABELED_GENRE = 'Unknown';
+
+function labelOf(track) {
+  return track.genre_name || UNLABELED_GENRE;
+}
+
 // Would queueing this track make the feed feel repetitive?
 function violatesDiversity(pool, track) {
-  if (!track.genre_name) return false;
-  const sameGenre = pool.recentGenres.filter(g => g === track.genre_name).length;
+  const label = labelOf(track);
+  const sameGenre = pool.recentGenres.filter(g => g === label).length;
   return sameGenre >= MAX_SAME_GENRE;
 }
 
 function noteQueued(pool, track) {
-  pool.recentGenres.push(track.genre_name || null);
+  pool.recentGenres.push(labelOf(track));
   if (pool.recentGenres.length > RECENT_WINDOW) pool.recentGenres.shift();
 }
+
+// Exposed for tests only: the guard is otherwise reachable only behind a live
+// Deezer fetch, and unlabeled tracks are hard to provoke on demand.
+export const __test_diversity = { violatesDiversity, noteQueued, UNLABELED_GENRE };
 
 // ── Affinity scoring ──────────────────────────────────────────────────────────
 
