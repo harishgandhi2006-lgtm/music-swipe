@@ -1,7 +1,7 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import SwipeCard from './SwipeCard.jsx';
 
-export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef, onShare }) {
+export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef }) {
   return (
     <div className="relative w-full h-full">
       {/* Back card (next track preview) */}
@@ -32,7 +32,6 @@ export default function CardStack({ currentTrack, nextTrack, onSwipe, swipeRef, 
               track={currentTrack}
               onSwipe={onSwipe}
               audioControls={swipeRef}
-              onShare={onShare}
             />
           </motion.div>
         )}

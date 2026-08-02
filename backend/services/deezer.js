@@ -40,6 +40,10 @@ export async function getAlbum(albumId) {
   return deezerGet(`/album/${albumId}`);
 }
 
+export async function getTrack(trackId) {
+  return deezerGet(`/track/${trackId}`);
+}
+
 export async function getArtistTop(artistId, limit = 50) {
   const data = await deezerGet(`/artist/${artistId}/top?limit=${limit}`);
   return data.data || [];

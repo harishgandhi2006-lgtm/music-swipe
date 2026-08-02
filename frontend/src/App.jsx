@@ -1,37 +1,22 @@
-import { useState, useEffect, useCallback } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { useState, useCallback } from 'react';
 import { useAuth } from './auth/AuthContext.jsx';
 import AuthScreen from './auth/AuthScreen.jsx';
 import DiscoverView from './views/DiscoverView.jsx';
-import FriendsView from './views/FriendsView.jsx';
-import InboxView from './views/InboxView.jsx';
+import HistoryView from './views/HistoryView.jsx';
 import ProfileView from './views/ProfileView.jsx';
+import SettingsView from './views/SettingsView.jsx';
 import BottomNav from './components/BottomNav.jsx';
 import FeedbackToast from './components/FeedbackToast.jsx';
-import { fetchUnseenCount } from './api.js';
+import SharePreviewView from './views/SharePreviewView.jsx';
 
 export default function App() {
   const { user, loading } = useAuth();
   const [view, setView] = useState('discover');
   const [toast, setToast] = useState(null);
-  const [friendProfileId, setFriendProfileId] = useState(null);
-  const [unseenCount, setUnseenCount] = useState(0);
 
-  // Poll unseen inbox count every 30s when logged in
-  useEffect(() => {
-    if (!user) return;
-    const refresh = () => fetchUnseenCount().then(d => setUnseenCount(d.count)).catch(() => {});
-    refresh();
-    const interval = setInterval(refresh, 30000);
-    return () => clearInterval(interval);
-  }, [user]);
-
-  // Refresh count when switching to inbox
-  useEffect(() => {
-    if (view === 'inbox' && user) {
-      setTimeout(() => fetchUnseenCount().then(d => setUnseenCount(d.count)).catch(() => {}), 800);
-    }
-  }, [view, user]);
+  // Checked before the auth gate below: a recipient opening a shared link has
+  // no account, and must never be shown the login screen to see a preview.
+  if (window.location.pathname === '/share') return <SharePreviewView />;
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -42,11 +27,6 @@ export default function App() {
     // Delay slightly so it doesn't clash with the swipe toast
     setTimeout(() => showToast({ type: 'badge', ...badge }), 700);
   }, [showToast]);
-
-  function handleNavigate(v) {
-    setView(v);
-    setFriendProfileId(null);
-  }
 
   if (loading) {
     return (
@@ -68,43 +48,21 @@ export default function App() {
             showToast={showToast}
           />
         )}
-        {view === 'friends' && (
-          <FriendsView
-            onOpenProfile={setFriendProfileId}
-            showToast={showToast}
-          />
-        )}
-        {view === 'inbox' && (
-          <InboxView showToast={showToast} />
+        {view === 'history' && (
+          <HistoryView />
         )}
         {view === 'profile' && (
-          <ProfileView userId={user.id} />
+          <ProfileView onOpenSettings={() => setView('settings')} />
         )}
-
-        {/* Friend profile overlay */}
-        <AnimatePresence>
-          {friendProfileId && (
-            <motion.div
-              className="absolute inset-0 z-30 bg-[#0f0f0f]"
-              initial={{ x: '100%' }}
-              animate={{ x: 0 }}
-              exit={{ x: '100%' }}
-              transition={{ type: 'spring', damping: 28, stiffness: 300 }}
-            >
-              <ProfileView
-                userId={friendProfileId}
-                onBack={() => setFriendProfileId(null)}
-              />
-            </motion.div>
-          )}
-        </AnimatePresence>
+        {view === 'settings' && (
+          <SettingsView onBack={() => setView('profile')} />
+        )}
       </div>
 
       {/* Bottom nav */}
       <BottomNav
         activeView={view}
-        onNavigate={handleNavigate}
-        unseenCount={unseenCount}
+        onNavigate={setView}
       />
 
       {/* Global toast */}

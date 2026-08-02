@@ -3,7 +3,12 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const sqlite = new DatabaseSync(join(__dirname, 'music_swipe.db'));
+
+// Overridable so the test run can point at a throwaway file. Without this,
+// importing this module — which every service does, transitively — would open
+// the developer's real database, and any test that writes would corrupt it.
+const DB_PATH = process.env.MUSIC_SWIPE_DB || join(__dirname, 'music_swipe.db');
+const sqlite = new DatabaseSync(DB_PATH);
 
 sqlite.exec('PRAGMA journal_mode = WAL');
 sqlite.exec('PRAGMA foreign_keys = ON');
@@ -40,6 +45,12 @@ sqlite.exec(`
     created_at INTEGER DEFAULT (unixepoch() * 1000)
   );
 
+  -- Every read of this table is "one user's rows, newest first": the liked
+  -- archive, the history log, and the recommender's seen-set exclusion. Without
+  -- this they were all full scans that grew with every swipe in the database.
+  CREATE INDEX IF NOT EXISTS idx_interactions_user
+    ON interactions (user_id, id DESC);
+
   CREATE TABLE IF NOT EXISTS genre_scores (
     user_id TEXT NOT NULL,
     genre_id INTEGER NOT NULL,
@@ -62,31 +73,6 @@ sqlite.exec(`
     PRIMARY KEY (user_id, artist_id)
   );
 
-  CREATE TABLE IF NOT EXISTS friendships (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id_1 INTEGER NOT NULL REFERENCES users(id),
-    user_id_2 INTEGER NOT NULL REFERENCES users(id),
-    status TEXT NOT NULL CHECK(status IN ('pending','accepted','declined')),
-    requester_id INTEGER NOT NULL REFERENCES users(id),
-    created_at INTEGER DEFAULT (unixepoch()),
-    updated_at INTEGER DEFAULT (unixepoch()),
-    UNIQUE(user_id_1, user_id_2)
-  );
-
-  CREATE TABLE IF NOT EXISTS shared_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender_id INTEGER NOT NULL REFERENCES users(id),
-    receiver_id INTEGER NOT NULL REFERENCES users(id),
-    item_type TEXT NOT NULL CHECK(item_type IN ('track','artist')),
-    item_id INTEGER NOT NULL,
-    message TEXT,
-    seen INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch())
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_shared_items_receiver
-    ON shared_items (receiver_id, created_at DESC);
-
   CREATE TABLE IF NOT EXISTS badges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -94,36 +80,97 @@ sqlite.exec(`
     unlocked_at INTEGER DEFAULT (unixepoch()),
     UNIQUE(user_id, badge_key)
   );
+
+  -- A user's own explicit override of the recommender's weight distribution.
+  -- Each column is nullable independently ("use the default for this one"),
+  -- and there is deliberately no column for anything beyond these three
+  -- sliders — see effectiveWeights in recommender.js, which is what makes it
+  -- structurally impossible for this table to smuggle in a forbidden signal.
+  CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id TEXT PRIMARY KEY,
+    genre_weight REAL,
+    artist_weight REAL,
+    exploration_rate REAL,
+    updated_at INTEGER DEFAULT (unixepoch() * 1000)
+  );
+
+  -- getGenreInteractionCounts / getArtistInteractionCounts join tracks on these
+  -- and run four times on every single swipe — until now, as four full scans.
+  CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks (artist_id);
+  CREATE INDEX IF NOT EXISTS idx_tracks_genre  ON tracks (genre_id);
 `);
 
-// ── Migration: shared_songs → shared_items ────────────────────────────────────
-// The old table was track-only. Carry any existing rows over as 'track' shares
-// before dropping it. Runs once; the DROP is what makes it idempotent.
+// ── Migration: drop the collaborative-filtering neighbor cache ───────────────
+// A prior revision cached top-K taste-neighbor similarity (user_neighbors) to
+// feed a CF term into the recommender. That term has been removed by policy —
+// the recommendation engine is individual-input-only — and the table carried
+// no data worth preserving (a pure derived cache), so it is dropped outright
+// rather than left behind as dormant, unused infrastructure.
 {
   const legacy = sqlite.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'shared_songs'"
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_neighbors'"
   ).get();
-
   if (legacy) {
-    const carried = sqlite.prepare('SELECT COUNT(*) as n FROM shared_songs').get().n;
-    sqlite.exec(`
-      INSERT INTO shared_items (id, sender_id, receiver_id, item_type, item_id, message, seen, created_at)
-        SELECT id, sender_id, receiver_id, 'track', track_id, message, seen, created_at
-        FROM shared_songs;
-      DROP TABLE shared_songs;
-    `);
-    console.log(`Migrated ${carried} row(s) from shared_songs to shared_items`);
+    sqlite.exec('DROP TABLE user_neighbors');
+    console.log('Dropped deprecated user_neighbors table (CF removed by policy)');
   }
 }
 
-// Collapse flat score rows into Map<userId, Map<key, { likes, name }>>
-function groupVectors(rows, keyCol, nameCol) {
-  const byUser = new Map();
-  for (const r of rows) {
-    if (!byUser.has(r.uid)) byUser.set(r.uid, new Map());
-    byUser.get(r.uid).set(r[keyCol], { likes: r.likes, name: r[nameCol] });
+// ── Migration: drop friend-graph and crowd-signal tables ─────────────────────
+// Removed by policy: friendships/shared_items implemented a friend graph, and
+// track_stats aggregated swipes across all users into the recommender's
+// desirability score — both are cross-user data the isolation policy forbids
+// (see .claude/skills/strict-isolation/SKILL.md). shared_songs is the older,
+// already-superseded name for shared_items. None of this data is
+// reconstructable from what remains, so it's a hard drop, not a migration.
+for (const table of ['friendships', 'shared_items', 'shared_songs', 'track_stats']) {
+  const exists = sqlite.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"
+  ).get(table);
+  if (exists) {
+    sqlite.exec(`DROP TABLE ${table}`);
+    console.log(`Dropped ${table} (removed by data-isolation policy)`);
   }
-  return byUser;
+}
+
+/**
+ * Per-user affinity, symmetrically smoothed.
+ *
+ * Was `likes / (likes + rejects + 1)`, which was mis-calibrated against the 0.5
+ * prior the recommender falls back to for an unseen genre or artist. Under that
+ * formula a genre with one like and no rejects also scored exactly 0.5 — no
+ * better than never having been seen — and one like against one reject scored
+ * 0.333, i.e. *worse* than unknown. A genre needed two likes simply to register
+ * as better than silence.
+ *
+ * Symmetric Laplace puts the no-evidence value at 0.5 by construction, so the
+ * scale now reads honestly against the prior:
+ *
+ *   0L 0R -> 0.500   no evidence, same as unknown
+ *   1L 0R -> 0.667   one like genuinely beats silence
+ *   1L 1R -> 0.500   mixed evidence lands back at neutral
+ *   0L 1R -> 0.333   a reject genuinely loses to silence
+ *   2L 0R -> 0.750
+ *
+ * The 0.5 crossover is what makes "score > 0.5" mean "liked more than rejected",
+ * which is exactly what the top-genre and top-artist thresholds want to express.
+ */
+export function affinityScore(likes, rejects) {
+  return (likes + 1) / (likes + rejects + 2);
+}
+
+// ── Normalize affinity scores to the current formula ──────────────────────────
+// `score` is a pure function of the `likes`/`rejects` columns stored beside it,
+// so it can always be rebuilt from them. Rows written under the previous
+// formula would otherwise keep their old values until the user happened to
+// swipe that genre again — and read against the new thresholds, a stale score
+// silently empties the top-genre and top-artist lists the recommender steers by.
+//
+// Unconditional rather than version-guarded: it is idempotent, both tables are
+// small, and running it every boot means the columns can never drift out of
+// step with the formula again.
+for (const table of ['genre_scores', 'artist_scores']) {
+  sqlite.exec(`UPDATE ${table} SET score = (likes + 1.0) / (likes + rejects + 2.0)`);
 }
 
 const db = {
@@ -138,12 +185,6 @@ const db = {
   getUserById(id) {
     return sqlite.prepare('SELECT id, username, created_at FROM users WHERE id = ?').get(id) || null;
   },
-  searchUsers(query, excludeId) {
-    return sqlite.prepare(
-      "SELECT id, username FROM users WHERE username LIKE ? AND id != ? LIMIT 20"
-    ).all(`%${query}%`, excludeId);
-  },
-
   // ── tracks ─────────────────────────────────────────────────────────────────
   upsertTrack(track) {
     sqlite.prepare(`
@@ -163,6 +204,19 @@ const db = {
     sqlite.prepare('INSERT INTO interactions (user_id, track_id, action, created_at) VALUES (?, ?, ?, ?)').run(String(userId), track_id, action, now);
     const row = sqlite.prepare('SELECT last_insert_rowid() as id').get();
     return { id: row.id, user_id: userId, track_id, action, created_at: now };
+  },
+  // Undo support: removes at most the single newest matching interaction, and
+  // only if it's still fresh. The freshness check is what stops an undo from
+  // reaching past a track re-served much later and deleting an unrelated,
+  // older swipe of the same track.
+  deleteRecentInteraction(userId, track_id, withinMs) {
+    const row = sqlite.prepare(
+      'SELECT id, action, created_at FROM interactions WHERE user_id = ? AND track_id = ? ORDER BY id DESC LIMIT 1'
+    ).get(String(userId), track_id);
+    if (!row) return null;
+    if (Date.now() - row.created_at > withinMs) return null;
+    sqlite.prepare('DELETE FROM interactions WHERE id = ?').run(row.id);
+    return row;
   },
   getSeenTrackIds(userId) {
     const rows = sqlite.prepare('SELECT DISTINCT track_id FROM interactions WHERE user_id = ?').all(String(userId));
@@ -187,9 +241,90 @@ const db = {
     `).all(String(userId), limit);
   },
 
+  // ── session window ──────────────────────────────────────────────────────────
+  // Swipes belonging to the *current* sitting: everything newer than the most
+  // recent gap longer than `gapMs`.
+  //
+  // Derived here rather than read from the client's session log, which is
+  // sessionStorage-only by design, deduped by track_id (so it loses repeat
+  // swipes — exactly the signal momentum needs), and forgeable besides.
+  //
+  // LAG over `id DESC` yields the *newer* neighbour, so `newer_at - created_at`
+  // is the forward gap. The inner MAX(id) is the newest row sitting on the far
+  // side of a break; anything above it belongs to this session. COALESCE(...,0)
+  // covers "no break inside the window" — the whole window is one session.
+  // Rides idx_interactions_user as a bounded index scan, so cost is independent
+  // of how much history exists.
+  getSessionSwipes(userId, gapMs = 1_800_000, maxRows = 40) {
+    return sqlite.prepare(`
+      WITH recent AS (
+        SELECT i.id, i.action, i.created_at,
+               t.genre_id, t.genre_name, t.artist_id
+        FROM interactions i
+        LEFT JOIN tracks t ON t.id = i.track_id
+        WHERE i.user_id = ?
+        ORDER BY i.id DESC
+        LIMIT ?
+      ),
+      gapped AS (
+        SELECT *, LAG(created_at) OVER (ORDER BY id DESC) AS newer_at FROM recent
+      )
+      SELECT id, action, created_at, genre_id, genre_name, artist_id
+      FROM gapped
+      WHERE id > COALESCE(
+        (SELECT MAX(id) FROM gapped
+          WHERE newer_at IS NOT NULL AND newer_at - created_at > ?), 0)
+      ORDER BY id DESC
+    `).all(String(userId), maxRows, gapMs);
+  },
+
+  // The last few tracks this user actually swiped, for rebuilding the fatigue
+  // window after a process restart (the in-memory pool doesn't survive one).
+  getRecentContext(userId, limit = 10) {
+    return sqlite.prepare(`
+      SELECT t.artist_id, t.album_id, t.genre_name
+      FROM interactions i
+      JOIN tracks t ON t.id = i.track_id
+      WHERE i.user_id = ?
+      ORDER BY i.id DESC LIMIT ?
+    `).all(String(userId), limit);
+  },
+
+  // ── liked archive ───────────────────────────────────────────────────────────
+  // The permanent layer: every track this user has ever liked, newest first.
+  //
+  // Grouped by track_id rather than returned per row, because this is a library
+  // of songs and not a log of events — a song liked twice (via Discover and
+  // again from a friend's share in the inbox) should occupy one slot, at the
+  // time of the most recent like. getHistory above is the event log.
+  //
+  // INNER JOIN is deliberate: a like whose track row is missing has no title or
+  // artwork to render, so it would only ever paint an empty shelf.
+  getLikedArchive(userId, limit = 50, offset = 0) {
+    return sqlite.prepare(`
+      SELECT MAX(i.id) AS id, MAX(i.created_at) AS liked_at, i.track_id,
+             t.title, t.artist_name, t.artist_id, t.album_title,
+             t.cover_url, t.genre_name, t.duration
+      FROM interactions i
+      JOIN tracks t ON t.id = i.track_id
+      WHERE i.user_id = ? AND i.action = 'like'
+      GROUP BY i.track_id
+      ORDER BY id DESC
+      LIMIT ? OFFSET ?
+    `).all(String(userId), limit, offset);
+  },
+
+  // DISTINCT to match the grouping above, so the total agrees with what
+  // paging through getLikedArchive actually yields.
+  countLikedArchive(userId) {
+    return sqlite.prepare(
+      "SELECT COUNT(DISTINCT track_id) AS n FROM interactions WHERE user_id = ? AND action = 'like'"
+    ).get(String(userId)).n;
+  },
+
   // ── genre scores ────────────────────────────────────────────────────────────
   upsertGenreScore(userId, genre_id, genre_name, likes, rejects) {
-    const score = likes / (likes + rejects + 1);
+    const score = affinityScore(likes, rejects);
     sqlite.prepare(`
       INSERT INTO genre_scores (user_id, genre_id, genre_name, likes, rejects, score, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -204,7 +339,10 @@ const db = {
   getGenreScores(userId) {
     return sqlite.prepare('SELECT * FROM genre_scores WHERE user_id = ? ORDER BY score DESC').all(String(userId));
   },
-  getTopGenres(userId, minScore = 0.3, limit = 5) {
+  // 0.5 is the crossover under affinityScore: above it means strictly more
+  // likes than rejects. The old 0.3 was tuned to the old curve — carried over
+  // unchanged it would have admitted a genre with a single reject.
+  getTopGenres(userId, minScore = 0.5, limit = 5) {
     return sqlite.prepare(
       'SELECT * FROM genre_scores WHERE user_id = ? AND score > ? AND likes > 0 ORDER BY score DESC LIMIT ?'
     ).all(String(userId), minScore, limit);
@@ -229,7 +367,7 @@ const db = {
 
   // ── artist scores ───────────────────────────────────────────────────────────
   upsertArtistScore(userId, artist_id, artist_name, likes, rejects) {
-    const score = likes / (likes + rejects + 1);
+    const score = affinityScore(likes, rejects);
     sqlite.prepare(`
       INSERT INTO artist_scores (user_id, artist_id, artist_name, likes, rejects, score, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -244,7 +382,10 @@ const db = {
   getArtistScores(userId) {
     return sqlite.prepare('SELECT * FROM artist_scores WHERE user_id = ? ORDER BY score DESC').all(String(userId));
   },
-  getTopArtists(userId, minScore = 0.4, limit = 5) {
+  // Held slightly above the genre bar, preserving the relative strictness the
+  // old 0.4-vs-0.3 pairing encoded: artist affinity is a narrower claim, so it
+  // should need marginally more evidence than genre affinity.
+  getTopArtists(userId, minScore = 0.55, limit = 5) {
     return sqlite.prepare(
       'SELECT * FROM artist_scores WHERE user_id = ? AND score > ? AND likes > 0 ORDER BY score DESC LIMIT ?'
     ).all(String(userId), minScore, limit);
@@ -272,149 +413,20 @@ const db = {
     return { mean, stddev: Math.max(Math.sqrt(variance), 30) };
   },
 
-  // ── friendships ─────────────────────────────────────────────────────────────
-  sendFriendRequest(requesterId, targetId) {
-    const [uid1, uid2] = [Math.min(requesterId, targetId), Math.max(requesterId, targetId)];
+  // ── user preferences ─────────────────────────────────────────────────────────
+  getUserPreferences(userId) {
+    return sqlite.prepare(
+      'SELECT genre_weight, artist_weight, exploration_rate FROM user_preferences WHERE user_id = ?'
+    ).get(String(userId)) || null;
+  },
+  upsertUserPreferences(userId, { genre_weight, artist_weight, exploration_rate }) {
     sqlite.prepare(`
-      INSERT OR IGNORE INTO friendships (user_id_1, user_id_2, status, requester_id)
-      VALUES (?, ?, 'pending', ?)
-    `).run(uid1, uid2, requesterId);
-  },
-  respondFriendRequest(friendshipId, responderId, status) {
-    const f = sqlite.prepare('SELECT * FROM friendships WHERE id = ?').get(friendshipId);
-    if (!f) return null;
-    if (f.requester_id === responderId) return null;
-    if (f.user_id_1 !== responderId && f.user_id_2 !== responderId) return null;
-    sqlite.prepare('UPDATE friendships SET status = ?, updated_at = unixepoch() WHERE id = ?').run(status, friendshipId);
-    return sqlite.prepare('SELECT * FROM friendships WHERE id = ?').get(friendshipId);
-  },
-  getFriends(userId) {
-    return sqlite.prepare(`
-      SELECT f.id as friendship_id,
-        CASE WHEN f.user_id_1 = ? THEN u2.id       ELSE u1.id       END as friend_id,
-        CASE WHEN f.user_id_1 = ? THEN u2.username ELSE u1.username END as friend_username
-      FROM friendships f
-      JOIN users u1 ON u1.id = f.user_id_1
-      JOIN users u2 ON u2.id = f.user_id_2
-      WHERE (f.user_id_1 = ? OR f.user_id_2 = ?) AND f.status = 'accepted'
-    `).all(userId, userId, userId, userId);
-  },
-  getPendingRequests(userId) {
-    return sqlite.prepare(`
-      SELECT f.id as friendship_id, f.requester_id, u.username as requester_username, f.created_at
-      FROM friendships f
-      JOIN users u ON u.id = f.requester_id
-      WHERE (f.user_id_1 = ? OR f.user_id_2 = ?)
-        AND f.status = 'pending' AND f.requester_id != ?
-    `).all(userId, userId, userId);
-  },
-  removeFriend(friendshipId, userId) {
-    const f = sqlite.prepare('SELECT * FROM friendships WHERE id = ?').get(friendshipId);
-    if (!f || (f.user_id_1 !== userId && f.user_id_2 !== userId)) return false;
-    sqlite.prepare('DELETE FROM friendships WHERE id = ?').run(friendshipId);
-    return true;
-  },
-  getFriendshipStatus(userId1, userId2) {
-    const [uid1, uid2] = [Math.min(userId1, userId2), Math.max(userId1, userId2)];
-    return sqlite.prepare('SELECT * FROM friendships WHERE user_id_1 = ? AND user_id_2 = ?').get(uid1, uid2) || null;
-  },
-
-  // ── taste matching ──────────────────────────────────────────────────────────
-  // Users who aren't `userId`, aren't already connected (pending or accepted),
-  // and have enough swipe history to compare against.
-  getTasteMatchCandidates(userId, minLikes = 5) {
-    return sqlite.prepare(`
-      SELECT u.id, u.username
-      FROM users u
-      WHERE u.id != ?
-        AND u.id NOT IN (
-          SELECT CASE WHEN f.user_id_1 = ? THEN f.user_id_2 ELSE f.user_id_1 END
-          FROM friendships f
-          WHERE (f.user_id_1 = ? OR f.user_id_2 = ?)
-            AND f.status IN ('pending', 'accepted')
-        )
-        AND (
-          SELECT COALESCE(SUM(gs.likes), 0)
-          FROM genre_scores gs
-          WHERE gs.user_id = CAST(u.id AS TEXT)
-        ) >= ?
-    `).all(userId, userId, userId, userId, minLikes);
-  },
-
-  // Liked-genre vectors for a set of users, keyed by user id.
-  // user_id is TEXT here but INTEGER in users — cast on the way out.
-  getGenreVectors(userIds) {
-    if (userIds.length === 0) return new Map();
-    const placeholders = userIds.map(() => '?').join(',');
-    const rows = sqlite.prepare(`
-      SELECT CAST(user_id AS INTEGER) as uid, genre_id, genre_name, likes
-      FROM genre_scores
-      WHERE user_id IN (${placeholders}) AND likes > 0
-    `).all(...userIds.map(String));
-    return groupVectors(rows, 'genre_id', 'genre_name');
-  },
-
-  getArtistVectors(userIds) {
-    if (userIds.length === 0) return new Map();
-    const placeholders = userIds.map(() => '?').join(',');
-    const rows = sqlite.prepare(`
-      SELECT CAST(user_id AS INTEGER) as uid, artist_id, artist_name, likes
-      FROM artist_scores
-      WHERE user_id IN (${placeholders}) AND likes > 0
-    `).all(...userIds.map(String));
-    return groupVectors(rows, 'artist_id', 'artist_name');
-  },
-
-  // ── shared items (tracks + artists) ─────────────────────────────────────────
-  shareItem(senderId, receiverId, itemType, itemId, message = null) {
-    sqlite.prepare(`
-      INSERT INTO shared_items (sender_id, receiver_id, item_type, item_id, message)
+      INSERT INTO user_preferences (user_id, genre_weight, artist_weight, exploration_rate, updated_at)
       VALUES (?, ?, ?, ?, ?)
-    `).run(senderId, receiverId, itemType, itemId, message);
-    return sqlite.prepare('SELECT last_insert_rowid() as id').get().id;
-  },
-
-  // We only store artist metadata as a side effect of caching tracks, so an
-  // artist share resolves its name/artwork from any track by that artist.
-  getArtistMeta(artistId) {
-    return sqlite.prepare(`
-      SELECT artist_id, artist_name, cover_url, genre_name
-      FROM tracks
-      WHERE artist_id = ? AND artist_name != ''
-      ORDER BY rank DESC
-      LIMIT 1
-    `).get(artistId) || null;
-  },
-
-  getInbox(userId) {
-    return sqlite.prepare(`
-      SELECT si.id, si.sender_id, si.item_type, si.item_id, si.message, si.seen, si.created_at,
-             u.username as sender_username,
-             t.title, t.cover_url, t.preview_url, t.duration,
-             COALESCE(t.artist_name, a.artist_name) as artist_name,
-             COALESCE(t.genre_name,  a.genre_name)  as genre_name,
-             a.cover_url as artist_cover
-      FROM shared_items si
-      JOIN users u ON u.id = si.sender_id
-      LEFT JOIN tracks t
-        ON si.item_type = 'track' AND t.id = si.item_id
-      LEFT JOIN (
-        SELECT artist_id, artist_name, genre_name, cover_url,
-               ROW_NUMBER() OVER (PARTITION BY artist_id ORDER BY rank DESC) as rn
-        FROM tracks
-        WHERE artist_name != ''
-      ) a ON si.item_type = 'artist' AND a.artist_id = si.item_id AND a.rn = 1
-      WHERE si.receiver_id = ?
-      ORDER BY si.created_at DESC, si.id DESC
-    `).all(userId);
-  },
-
-  markSeen(sharedItemId, userId) {
-    sqlite.prepare('UPDATE shared_items SET seen = 1 WHERE id = ? AND receiver_id = ?').run(sharedItemId, userId);
-  },
-
-  getUnseenCount(userId) {
-    return sqlite.prepare('SELECT COUNT(*) as n FROM shared_items WHERE receiver_id = ? AND seen = 0').get(userId)?.n || 0;
+      ON CONFLICT(user_id) DO UPDATE SET
+        genre_weight = excluded.genre_weight, artist_weight = excluded.artist_weight,
+        exploration_rate = excluded.exploration_rate, updated_at = excluded.updated_at
+    `).run(String(userId), genre_weight ?? null, artist_weight ?? null, exploration_rate ?? null, Date.now());
   },
 
   // ── badges ──────────────────────────────────────────────────────────────────

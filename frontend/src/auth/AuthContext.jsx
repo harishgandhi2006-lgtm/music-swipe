@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { setUnauthorizedHandler } from '../api.js';
+import { clearSessionHistory } from '../sessionHistory.js';
 
 const AuthContext = createContext(null);
 
@@ -32,6 +33,7 @@ export function AuthProvider({ children }) {
       setToken(null);
       setUser(null);
       setSessionExpired(true);
+      clearSessionHistory();
     });
     return () => setUnauthorizedHandler(null);
   }, []);
@@ -50,6 +52,10 @@ export function AuthProvider({ children }) {
     setToken(null);
     setUser(null);
     setSessionExpired(false);
+    // The session log is one user's swipes. sessionStorage outlives a logout,
+    // so without this the next person to sign in on this tab would open History
+    // to someone else's listening.
+    clearSessionHistory();
   }, []);
 
   return (

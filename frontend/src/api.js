@@ -68,95 +68,48 @@ export async function postInteraction(track_id, action) {
   return res.json();
 }
 
+// Undo: removes the most recent matching interaction server-side, within a
+// short grace window enforced by the backend. 404 means the window already
+// closed (or there was nothing to remove) — callers treat that as a no-op.
+export async function deleteInteraction(track_id) {
+  const res = await request(`/interactions/${track_id}`, { method: 'DELETE' });
+  if (!res.ok && res.status !== 404) throw new Error(`Failed to undo: ${res.status}`);
+  return res.status === 404 ? { ok: false } : res.json();
+}
+
 export async function fetchHistory() {
   const res = await request('/interactions/history');
   if (!res.ok) throw new Error('Failed to fetch history');
   return res.json();
 }
 
-// ── Social: user search & profile ───────────────────────────────────────────
-export async function searchUsers(query) {
-  const res = await request(`/users/search?q=${encodeURIComponent(query)}`);
-  if (!res.ok) throw new Error('Search failed');
+// The permanent liked archive. Paginated because this grows without bound —
+// unlike the session log, which the browser discards on its own.
+export async function fetchLikedArchive(limit = 50, offset = 0) {
+  const res = await request(`/interactions/liked?limit=${limit}&offset=${offset}`);
+  if (!res.ok) throw new Error('Failed to fetch liked archive');
   return res.json();
 }
 
-export async function fetchUserProfile(userId) {
-  const res = await request(`/users/${userId}/profile`);
+// ── Profile ──────────────────────────────────────────────────────────────────
+export async function fetchProfile() {
+  const res = await request('/profile');
   if (!res.ok) throw new Error('Failed to fetch profile');
   return res.json();
 }
 
-// ── Social: taste matcher ────────────────────────────────────────────────────
-export async function fetchTasteMatches(limit = 20) {
-  const res = await request(`/users/taste-matches?limit=${limit}`);
-  if (!res.ok) throw new Error('Failed to fetch taste matches');
+// ── Taste-weight preferences ─────────────────────────────────────────────────
+export async function fetchPreferences() {
+  const res = await request('/profile/preferences');
+  if (!res.ok) throw new Error('Failed to fetch preferences');
   return res.json();
 }
 
-// ── Social: friends ──────────────────────────────────────────────────────────
-export async function sendFriendRequest(targetId) {
-  const res = await request('/friends/request', {
-    method: 'POST',
-    body: JSON.stringify({ targetId }),
+export async function updatePreferences(prefs) {
+  const res = await request('/profile/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(prefs),
   });
-  return res.json();
-}
-
-export async function respondFriendRequest(friendshipId, status) {
-  const res = await request('/friends/respond', {
-    method: 'POST',
-    body: JSON.stringify({ friendshipId, status }),
-  });
-  return res.json();
-}
-
-export async function fetchFriends() {
-  const res = await request('/friends');
-  if (!res.ok) throw new Error('Failed to fetch friends');
-  return res.json();
-}
-
-export async function fetchPendingRequests() {
-  const res = await request('/friends/pending');
-  if (!res.ok) throw new Error('Failed to fetch pending requests');
-  return res.json();
-}
-
-export async function removeFriend(friendshipId) {
-  const res = await request(`/friends/${friendshipId}`, { method: 'DELETE' });
-  return res.json();
-}
-
-// ── Social: sharing & inbox ──────────────────────────────────────────────────
-// itemType is 'track' or 'artist'
-export async function shareItem(receiverId, itemType, itemId, message = null) {
-  const res = await request('/share', {
-    method: 'POST',
-    body: JSON.stringify({ receiverId, itemType, itemId, message }),
-  });
-  if (!res.ok) throw new Error('Failed to share');
-  return res.json();
-}
-
-export async function fetchInbox() {
-  const res = await request('/inbox');
-  if (!res.ok) throw new Error('Failed to fetch inbox');
-  return res.json();
-}
-
-export async function fetchUnseenCount() {
-  try {
-    const res = await request('/inbox/unseen-count');
-    if (!res.ok) return { count: 0 };
-    return res.json();
-  } catch (err) {
-    if (err.isUnauthorized) throw err; // let the session teardown propagate
-    return { count: 0 };
-  }
-}
-
-export async function markSeen(sharedItemId) {
-  const res = await request(`/inbox/${sharedItemId}/seen`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to update preferences');
   return res.json();
 }

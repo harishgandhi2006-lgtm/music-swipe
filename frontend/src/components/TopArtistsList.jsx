@@ -1,4 +1,4 @@
-export default function TopArtistsList({ artists, onShare }) {
+export default function TopArtistsList({ artists }) {
   if (!artists?.length) {
     return (
       <div className="flex flex-col items-center py-6 gap-2">
@@ -29,19 +29,6 @@ export default function TopArtistsList({ artists, onShare }) {
               />
             </div>
           </div>
-          {onShare && (
-            <button
-              onClick={() => onShare(a)}
-              className="w-7 h-7 shrink-0 rounded-full text-white/30 hover:text-white hover:bg-white/10 transition flex items-center justify-center"
-              title={`Share ${a.artist_name}`}
-              aria-label={`Share ${a.artist_name}`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" />
-                <line x1="8.6" y1="10.5" x2="15.4" y2="6.5" /><line x1="8.6" y1="13.5" x2="15.4" y2="17.5" />
-              </svg>
-            </button>
-          )}
         </div>
       ))}
     </div>

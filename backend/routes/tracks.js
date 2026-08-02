@@ -24,7 +24,9 @@ router.get('/next', async (req, res) => {
     if (!track) return res.status(503).json({ error: 'No tracks available right now' });
     res.json({
       ...track,
-      preview_url: `/api/proxy/audio?url=${encodeURIComponent(track.preview_url)}`,
+      // Point at the track, not the signed URL we happen to hold — this track
+      // may have been pooled long enough for its Deezer token to expire.
+      preview_url: `/api/proxy/audio?trackId=${track.id}`,
     });
   } catch (err) {
     console.error('Error fetching next track:', err.message);

@@ -46,7 +46,7 @@ export default function AuthScreen() {
       >
         <div className="text-6xl mb-4">🎵</div>
         <h1 className="text-white font-bold text-3xl tracking-tight">Music Swipe</h1>
-        <p className="text-white/40 text-sm mt-2">Discover music · Connect with friends</p>
+        <p className="text-white/40 text-sm mt-2">Discover music, tuned to you</p>
       </motion.div>
 
       <motion.div
