@@ -105,6 +105,51 @@ sqlite.exec(`
   -- and run four times on every single swipe — until now, as four full scans.
   CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks (artist_id);
   CREATE INDEX IF NOT EXISTS idx_tracks_genre  ON tracks (genre_id);
+
+  -- ── social (walled off from the recommender) ────────────────────────────────
+  -- NOTE: named social_connection_requests/social_connections/
+  -- social_activity_events rather than "friendships" deliberately — that
+  -- exact name (plus shared_items/shared_songs/track_stats) is targeted by
+  -- the guarded DROP TABLE migration below, which removes cross-user data
+  -- the recommendation engine's isolation policy forbids. These tables are
+  -- unrelated to that policy: they back a UI-only social layer that
+  -- backend/services/recommender.js never reads and never imports from. See
+  -- backend/services/social.js and .claude/skills/audit-isolation/SKILL.md.
+  CREATE TABLE IF NOT EXISTS social_connection_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requester_id TEXT NOT NULL,
+    addressee_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','accepted','declined','blocked')),
+    created_at INTEGER DEFAULT (unixepoch() * 1000),
+    responded_at INTEGER,
+    UNIQUE(requester_id, addressee_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_social_requests_addressee ON social_connection_requests (addressee_id, status);
+
+  -- Canonical one-row-per-pair storage: user_a_id is always the
+  -- lexicographically smaller id, enforced by the CHECK, so a connection
+  -- never needs two rows or an OR'd query to look up either direction.
+  CREATE TABLE IF NOT EXISTS social_connections (
+    user_a_id TEXT NOT NULL,
+    user_b_id TEXT NOT NULL,
+    created_at INTEGER DEFAULT (unixepoch() * 1000),
+    PRIMARY KEY (user_a_id, user_b_id),
+    CHECK (user_a_id < user_b_id)
+  );
+
+  -- payload is display-only data copied at write time (track title/artist,
+  -- badge key) — never a live join back into interactions/genre_scores/
+  -- artist_scores/user_preferences. This is what keeps getActivityFeed's
+  -- cross-user read (the one legitimate one in the social layer) scoped to
+  -- activity metadata only, never affinity or preference data.
+  CREATE TABLE IF NOT EXISTS social_activity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT,
+    created_at INTEGER DEFAULT (unixepoch() * 1000)
+  );
+  CREATE INDEX IF NOT EXISTS idx_social_activity_user ON social_activity_events (user_id, id DESC);
 `);
 
 // ── Migration: drop the collaborative-filtering neighbor cache ───────────────
@@ -487,6 +532,61 @@ const db = {
 
     const badges = sqlite.prepare('SELECT badge_key, unlocked_at FROM badges WHERE user_id = ?').all(userId);
     return { genres, artists, badges };
+  },
+
+  // ── social (walled off — see backend/services/social.js) ───────────────────
+  createConnectionRequest(requesterId, addresseeId) {
+    sqlite.prepare(
+      "INSERT INTO social_connection_requests (requester_id, addressee_id, status) VALUES (?, ?, 'pending')"
+    ).run(String(requesterId), String(addresseeId));
+    return sqlite.prepare('SELECT * FROM social_connection_requests WHERE requester_id = ? AND addressee_id = ?')
+      .get(String(requesterId), String(addresseeId));
+  },
+  getConnectionRequest(requesterId, addresseeId) {
+    return sqlite.prepare('SELECT * FROM social_connection_requests WHERE requester_id = ? AND addressee_id = ?')
+      .get(String(requesterId), String(addresseeId)) || null;
+  },
+  getConnectionRequestById(id) {
+    return sqlite.prepare('SELECT * FROM social_connection_requests WHERE id = ?').get(id) || null;
+  },
+  updateConnectionRequestStatus(id, status) {
+    sqlite.prepare('UPDATE social_connection_requests SET status = ?, responded_at = ? WHERE id = ?')
+      .run(status, Date.now(), id);
+    return sqlite.prepare('SELECT * FROM social_connection_requests WHERE id = ?').get(id);
+  },
+  listPendingRequests(userId) {
+    return sqlite.prepare(
+      "SELECT * FROM social_connection_requests WHERE addressee_id = ? AND status = 'pending' ORDER BY id DESC"
+    ).all(String(userId));
+  },
+  // Canonical ordering (smaller id first) so a pair only ever occupies one row.
+  createConnection(userIdA, userIdB) {
+    const [a, b] = [String(userIdA), String(userIdB)].sort();
+    sqlite.prepare('INSERT OR IGNORE INTO social_connections (user_a_id, user_b_id) VALUES (?, ?)').run(a, b);
+  },
+  listConnections(userId) {
+    const id = String(userId);
+    const rows = sqlite.prepare(
+      'SELECT user_a_id, user_b_id FROM social_connections WHERE user_a_id = ? OR user_b_id = ?'
+    ).all(id, id);
+    return rows.map(r => (r.user_a_id === id ? r.user_b_id : r.user_a_id));
+  },
+  insertActivityEvent(userId, eventType, payload) {
+    sqlite.prepare('INSERT INTO social_activity_events (user_id, event_type, payload) VALUES (?, ?, ?)')
+      .run(String(userId), eventType, payload != null ? JSON.stringify(payload) : null);
+    const row = sqlite.prepare('SELECT last_insert_rowid() as id').get();
+    return row.id;
+  },
+  // `userIds` must already be the caller's own accepted-connection set (see
+  // social.js's getActivityFeed) — this function does no authorization of
+  // its own, it just fetches whatever ids it's given.
+  getActivityFeed(userIds, limit = 50) {
+    if (userIds.length === 0) return [];
+    const placeholders = userIds.map(() => '?').join(',');
+    return sqlite.prepare(
+      `SELECT id, user_id, event_type, payload, created_at FROM social_activity_events
+       WHERE user_id IN (${placeholders}) ORDER BY id DESC LIMIT ?`
+    ).all(...userIds.map(String), limit);
   },
 };
 

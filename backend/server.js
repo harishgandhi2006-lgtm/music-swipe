@@ -9,6 +9,7 @@ import proxyRouter from './routes/proxy.js';
 import authRouter from './routes/auth.js';
 import profileRouter from './routes/profile.js';
 import publicRouter from './routes/public.js';
+import socialRouter from './routes/social.js';
 import { warmPool } from './services/recommender.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -22,11 +23,15 @@ app.use('/api/auth', authRouter);
 app.use('/api/tracks', tracksRouter);
 app.use('/api/interactions', interactionsRouter);
 app.use('/api/proxy', proxyRouter);
-// Must be mounted before profileRouter: profileRouter applies requireAuth to
-// every request that reaches it (router.use with no path), which fires
+// Must be mounted before profileRouter/socialRouter: both apply requireAuth
+// to every request that reaches them (router.use with no path), which fires
 // before Express even checks for a matching route inside that router — so
-// any router sharing the '/api' prefix and mounted after it is unreachable.
+// any router sharing the '/api' prefix and mounted after either of them is
+// unreachable. socialRouter and profileRouter can be ordered either way
+// relative to each other since both share that same blanket-requireAuth
+// shape and don't overlap on routes.
 app.use('/api', publicRouter);
+app.use('/api', socialRouter);
 app.use('/api', profileRouter);
 
 // Serve frontend build in production
