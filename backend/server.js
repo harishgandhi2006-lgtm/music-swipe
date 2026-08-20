@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import tracksRouter from './routes/tracks.js';
@@ -16,10 +17,31 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+// Trust exactly one hop — the platform's own reverse proxy (Fly.io edge /
+// Railway proxy) — not `true`, which would trust the whole spoofable
+// X-Forwarded-For chain. The rate limiters below key off req.ip, which
+// depends on this being set correctly behind any reverse proxy.
+app.set('trust proxy', 1);
+
+const corsOptions = {
+  origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
+  credentials: true,
+};
+app.use(cors(corsOptions));
+
+// Ahead of express.json() so an over-quota request is rejected before
+// spending time parsing its body, and ahead of every route mount so it
+// covers the whole /api surface uniformly.
+const generalLimiter = rateLimit({ windowMs: 60 * 1000, limit: 100, standardHeaders: true, legacyHeaders: false });
+app.use('/api', generalLimiter);
+
+// Layers on top of generalLimiter at the /api/auth mount only — auth
+// endpoints get both the general budget and this stricter one.
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+
 app.use(express.json());
 
-app.use('/api/auth', authRouter);
+app.use('/api/auth', authLimiter, authRouter);
 app.use('/api/tracks', tracksRouter);
 app.use('/api/interactions', interactionsRouter);
 app.use('/api/proxy', proxyRouter);

@@ -56,8 +56,12 @@ router.get('/social/activity', (req, res) => {
 router.get('/social/stream', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    // no-transform stops intermediary caches/CDNs from re-encoding or
+    // buffering the event-stream body; X-Accel-Buffering below is the
+    // Nginx-specific equivalent for proxies that don't honor no-transform.
+    'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
   res.write('\n');
 

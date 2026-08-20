@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { mkdirSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -8,6 +9,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // importing this module — which every service does, transitively — would open
 // the developer's real database, and any test that writes would corrupt it.
 const DB_PATH = process.env.MUSIC_SWIPE_DB || join(__dirname, 'music_swipe.db');
+// No-op if the directory already exists (the common case locally and in
+// tests) — only does real work for a not-yet-existing path, e.g. a fresh
+// Fly volume mounted at /data on first boot.
+mkdirSync(dirname(DB_PATH), { recursive: true });
 const sqlite = new DatabaseSync(DB_PATH);
 
 sqlite.exec('PRAGMA journal_mode = WAL');
