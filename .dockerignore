@@ -1,0 +1,10 @@
+node_modules
+**/node_modules
+.git
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/.env
+frontend/dist
+.DS_Store
+*.md

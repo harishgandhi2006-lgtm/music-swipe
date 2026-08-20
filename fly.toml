@@ -1,0 +1,40 @@
+app = "music-swipe"          # replace with actual Fly app name
+primary_region = "iad"       # replace with target region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[mounts]]
+  source = "music_swipe_data"
+  destination = "/data"
+
+[env]
+  PORT = "3001"
+  NODE_ENV = "production"
+  MUSIC_SWIPE_DB = "/data/music_swipe.db"
+
+# Set post-deploy via `fly secrets set` — credential-shaped, or only known
+# once the frontend exists — never committed here as plain [env]:
+#   fly secrets set JWT_SECRET=<long-random-value>
+#   fly secrets set REDIS_URL=<redis-connection-string>       # optional
+#   fly secrets set CLIENT_ORIGIN=https://<vercel-app>.vercel.app
+#
+# The volume must be created once before the first deploy — [[mounts]]
+# above only references an existing volume by name, it does not allocate
+# one:
+#   fly volumes create music_swipe_data --region <region> --size 1
+#
+# IMPORTANT: a Fly volume is local to a single machine, so this backend
+# runs as exactly ONE instance under this config — no horizontal scaling
+# without LiteFS/Litestream replication or a Postgres migration (see
+# ARCHITECTURE.md's "Postgres migration: considered and deferred").
+#
+# Railway: the same root Dockerfile deploys there directly (Railway
+# auto-detects and builds Dockerfiles) — no separate config file needed.
