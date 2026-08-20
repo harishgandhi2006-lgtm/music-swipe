@@ -1,19 +1,12 @@
 {
-  "bash": {
-    "deniedCommands": [
-      "rm -rf",
-      "DROP TABLE",
-      "truncate"
-    ]
-  },
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "npm run test --if-present"
+            "command": "npm --prefix backend test"
           }
         ]
       }

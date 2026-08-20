@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "sqlite": {
+      "command": "/Users/harishgandhi/.local/bin/mcp-server-sqlite",
+      "args": [
+        "--db-path",
+        "backend/music_swipe.db"
+      ]
+    },
+    "puppeteer": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-puppeteer"
+      ]
+    }
+  }
+}
