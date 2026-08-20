@@ -40,14 +40,14 @@ export default function BottomNav({ activeView, onNavigate }) {
           <button
             key={tab.id}
             onClick={() => onNavigate(tab.id)}
-            className={`flex-1 flex flex-col items-center py-3 gap-1 relative transition-colors ${
+            className={`flex-1 flex flex-col items-center py-3 md:py-4 gap-1 md:gap-1.5 relative transition-colors ${
               active ? 'text-white' : 'text-white/30 hover:text-white/50'
             }`}
           >
-            <span className="relative">
+            <span className="relative md:scale-110">
               {tab.icon(active)}
             </span>
-            <span className={`text-[10px] font-medium ${active ? 'text-white' : 'text-white/30'}`}>
+            <span className={`text-[10px] md:text-xs font-medium ${active ? 'text-white' : 'text-white/30'}`}>
               {tab.label}
             </span>
             {active && (

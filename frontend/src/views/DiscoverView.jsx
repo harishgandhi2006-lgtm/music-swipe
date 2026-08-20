@@ -203,8 +203,10 @@ export default function DiscoverView({ onBadgeUnlocked, showToast }) {
         </div>
       </div>
 
-      {/* Card area */}
-      <div className="flex-1 relative" style={{ minHeight: 0 }}>
+      {/* Card area — width capped and centered from md: up so the card keeps
+          its portrait shape as the app shell widens, instead of the
+          absolute-inset-0 card stretching to fill the full shell width. */}
+      <div className="flex-1 relative w-full md:max-w-sm md:mx-auto" style={{ minHeight: 0 }}>
         {needsGesture && (
           <button
             className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 rounded-3xl backdrop-blur-sm gap-3"

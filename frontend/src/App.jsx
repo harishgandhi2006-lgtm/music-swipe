@@ -39,7 +39,7 @@ export default function App() {
   if (!user) return <AuthScreen />;
 
   return (
-    <div className="flex flex-col h-screen max-w-sm mx-auto bg-[#0f0f0f] select-none overflow-hidden">
+    <div className="flex flex-col h-screen max-w-sm sm:max-w-md md:max-w-2xl lg:max-w-4xl mx-auto bg-[#0f0f0f] select-none overflow-hidden">
       {/* Views */}
       <div className="flex-1 overflow-hidden relative">
         {view === 'discover' && (
