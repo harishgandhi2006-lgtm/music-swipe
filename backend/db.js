@@ -12,6 +12,13 @@ const sqlite = new DatabaseSync(DB_PATH);
 
 sqlite.exec('PRAGMA journal_mode = WAL');
 sqlite.exec('PRAGMA foreign_keys = ON');
+// Concurrency tuning for production load — see ARCHITECTURE.md for the
+// reasoning behind each value.
+sqlite.exec('PRAGMA busy_timeout = 5000');
+sqlite.exec('PRAGMA synchronous = NORMAL');
+sqlite.exec('PRAGMA cache_size = -20000');
+sqlite.exec('PRAGMA mmap_size = 268435456');
+sqlite.exec('PRAGMA wal_autocheckpoint = 1000');
 
 sqlite.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -196,6 +203,21 @@ const db = {
   },
   getTrack(id) {
     return sqlite.prepare('SELECT * FROM tracks WHERE id = ?').get(id) || null;
+  },
+  // Batched replacement for calling getTrack once per candidate. Chunked at
+  // 100 ids per statement since SQLite bounds the number of host parameters
+  // per query (default 999, not guaranteed across builds) — chunking keeps
+  // this correct regardless of how large a candidate batch grows to be,
+  // rather than implicitly depending on today's small candidate-pool sizes.
+  getTracksByIds(ids) {
+    const unique = [...new Set(ids)];
+    const rows = [];
+    for (let i = 0; i < unique.length; i += 100) {
+      const chunk = unique.slice(i, i + 100);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(...sqlite.prepare(`SELECT * FROM tracks WHERE id IN (${placeholders})`).all(...chunk));
+    }
+    return new Map(rows.map(row => [row.id, row]));
   },
 
   // ── interactions ────────────────────────────────────────────────────────────

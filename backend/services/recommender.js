@@ -266,8 +266,13 @@ function hydrateRecent(userId, pool) {
 // via getPool(profileUserId) — that keeps this and the functions below
 // testable against a throwaway buffer, without ever touching the real
 // per-user pool cache.
-function getAllExcluded(profileUserId, pool, skip) {
-  const interacted = db.getSeenTrackIds(profileUserId);
+// `interacted` is the user's full seen-track set, resolved once per
+// refillPool/serveFromPool call (see ctx in fetchOneTrack) rather than
+// re-scanned via db.getSeenTrackIds on every one of up to ~15 loop
+// iterations per refill — that scan runs over the user's entire
+// interaction history, so re-running it per iteration was the costliest
+// remaining per-loop query in this path.
+function getAllExcluded(interacted, pool, skip) {
   return new Set([...interacted, ...pool.ids, ...(skip || [])]);
 }
 
@@ -433,16 +438,22 @@ export const __test_fatigue = {
 
 // ── Affinity scoring ──────────────────────────────────────────────────────────
 
-function genreScore(userId, genre_id) {
+// Takes a pre-fetched Map rather than hitting the DB per call — genreScore/
+// artistScore used to run one query per candidate (up to ~100 per pickBest
+// call). Callers now fetch the user's full score set once via
+// buildAffinityMaps and pass the resulting Map in here for a plain in-memory
+// lookup instead.
+function genreScore(genreMap, genre_id) {
   if (!genre_id) return 0.5;
-  const s = db.getGenreScore(userId, genre_id);
-  return s !== null ? s : 0.5;
+  const s = genreMap.get(genre_id);
+  return s !== undefined ? s : 0.5;
 }
-function artistScore(userId, artist_id) {
+function artistScore(artistMap, artist_id) {
   if (!artist_id) return 0.5;
-  const s = db.getArtistScore(userId, artist_id);
-  return s !== null ? s : 0.5;
+  const s = artistMap.get(artist_id);
+  return s !== undefined ? s : 0.5;
 }
+
 // Takes the preference rather than the userId: resolving it here meant running
 // a JOIN aggregate over the user's entire like history once per candidate, up
 // to 100 times per call. It's hoisted to the top of pickBest now.
@@ -738,16 +749,30 @@ function normalizeTrack(raw, genre_id, genre_name) {
 // updates — explicit, rather than resolved internally via getPool(userId), so
 // tests can point pickBest at a throwaway buffer without touching the real
 // per-user pool cache.
+// Optional `scoreCtx` ({ durPref, weights, affinity }) lets a caller that
+// invokes pickBest repeatedly for the same user in one strategy call (e.g.
+// strategyTrackRadio, once per liked track) resolve the per-user scoring
+// inputs once and pass them straight through, instead of pickBest
+// re-fetching duration preference / weights / affinity maps — none of which
+// vary across those repeated calls — on every single invocation.
+async function buildScoreCtx(userId) {
+  return {
+    durPref: db.getDurationPreference(userId),
+    weights: effectiveWeights(db.getUserPreferences(userId)),
+    affinity: buildAffinityMapsSync(userId),
+  };
+}
+
 async function pickBest(userId, candidates, excluded, pool, opts = {}) {
-  const { mode = 'affinity', topN = 20 } = opts;
+  const { mode = 'affinity', topN = 20, scoreCtx } = opts;
 
   const all = candidates.filter(t => t.preview && !excluded.has(t.id));
   if (all.length === 0) return null;
 
-  // Resolved once for the whole batch rather than per candidate. The cache
-  // lookup was already happening per candidate; the duration preference was
-  // not, and it costs far more than a point read.
-  const cached = new Map(all.map(t => [t.id, db.getTrack(t.id)]));
+  // Resolved once for the whole batch rather than per candidate — one
+  // batched SQL query instead of one db.getTrack call per candidate.
+  const trackIds = all.map(t => t.id);
+  const cached = db.getTracksByIds(trackIds);
 
   // Burnout caps are applied here, before the top-N slice and before the winner
   // gets enriched — so a capped artist costs nothing, where the post-fetch guard
@@ -764,8 +789,9 @@ async function pickBest(userId, candidates, excluded, pool, opts = {}) {
 
   const rankOf  = t => rawRank(t, cached.get(t.id));
   const pctOf   = popPercentiles(eligible, rankOf);
-  const durPref = db.getDurationPreference(userId);
-  const weights = effectiveWeights(db.getUserPreferences(userId));
+  const durPref = scoreCtx?.durPref ?? db.getDurationPreference(userId);
+  const weights = scoreCtx?.weights ?? effectiveWeights(db.getUserPreferences(userId));
+  const { genreMap, artistMap } = scoreCtx?.affinity ?? buildAffinityMapsSync(userId);
 
   const scored = eligible.map(t => {
     let s;
@@ -778,8 +804,8 @@ async function pickBest(userId, candidates, excluded, pool, opts = {}) {
       s = 0.25 * popAbs(rankOf(t)) + 0.75 * Math.random();
     } else {
       s = (
-        weights.genre        * genreScore(userId, cached.get(t.id)?.genre_id ?? null) +
-        weights.artist       * artistScore(userId, t.artist?.id) +
+        weights.genre        * genreScore(genreMap, cached.get(t.id)?.genre_id ?? null) +
+        weights.artist       * artistScore(artistMap, t.artist?.id) +
         weights.duration     * durationScore(durPref, t.duration) +
         weights.popularity   * pctOf(t.id) +
         weights.desirability * desirabilityScore(rankOf(t))
@@ -821,9 +847,12 @@ async function strategyChart(userId, excluded, pool) {
 async function strategyTrackRadio(userId, excluded, pool) {
   const likedIds = db.getRecentlyLikedTrackIds(userId, 10);
   if (likedIds.length === 0) return null;
+  // Resolved once for up to 10 pickBest calls below, none of which vary by
+  // trackId — was previously re-fetched inside pickBest on every iteration.
+  const scoreCtx = await buildScoreCtx(userId);
   for (const trackId of likedIds) {
     const radio = await getTrackRadio(trackId, 25).catch(() => []);
-    const track = await pickBest(userId, radio, excluded, pool);
+    const track = await pickBest(userId, radio, excluded, pool, { scoreCtx });
     if (track) return track;
   }
   return null;
@@ -929,10 +958,25 @@ function tag(track, via) {
   return track;
 }
 
+// Shared bulk-fetch backing genreScore/artistScore in pickBest,
+// reRankAndServe, and buildScoreCtx alike — two SQLite queries per call
+// (db.getGenreScores/getArtistScores already return every row for the user
+// in one query) in place of the one-query-per-candidate pattern this
+// replaces. Deliberately synchronous: reRankAndServe is on the hot re-rank
+// path that a long stretch of the test suite and scripts/simulate.js call
+// directly and treat as synchronous.
+function buildAffinityMapsSync(userId) {
+  return {
+    genreMap: new Map(db.getGenreScores(userId).map(r => [r.genre_id, r.score])),
+    artistMap: new Map(db.getArtistScores(userId).map(r => [r.artist_id, r.score])),
+  };
+}
+
 function reRankAndServe(userId, pool) {
   const mom     = computeMomentum(userId, pool);
   const durPref = db.getDurationPreference(userId);
   const weights = effectiveWeights(db.getUserPreferences(userId));
+  const { genreMap, artistMap } = buildAffinityMapsSync(userId);
 
   // Percentile within the pool, for the same reason pickBest uses one: absolute
   // rank saturates and stops discriminating. Shared helper, so tie handling
@@ -946,8 +990,8 @@ function reRankAndServe(userId, pool) {
   const len = pool.tracks.length;
   const scored = pool.tracks.map((t, i) => {
     const base =
-      weights.genre        * genreScore(userId, t.genre_id) +
-      weights.artist       * artistScore(userId, t.artist_id) +
+      weights.genre        * genreScore(genreMap, t.genre_id) +
+      weights.artist       * artistScore(artistMap, t.artist_id) +
       weights.duration     * durationScore(durPref, t.duration) +
       weights.popularity   * pctOf(t.id) +
       weights.desirability * desirabilityScore(t.rank);
@@ -1024,9 +1068,16 @@ function reRankAndServe(userId, pool) {
 // The two are kept as separate parameters (rather than pool being resolved
 // internally from userId) purely for testability against a throwaway buffer.
 
-async function fetchOneTrack(userId, pool, skip) {
-  const excluded = getAllExcluded(userId, pool, skip);
-  const total    = db.countInteractions(userId);
+// `ctx` ({ total, prefs }) is resolved once per refillPool/serveFromPool
+// call by the caller and threaded through here, rather than re-read via
+// db.countInteractions/getUserPreferences on every one of up to
+// POOL_TARGET + MAX_DIVERSITY_SKIPS loop iterations — neither value changes
+// mid-refill. getRecentlyLikedTrackIds/getTopArtists below stay live inside
+// the loop on purpose: a track fetched mid-refill can legitimately change
+// which strategy fires next.
+async function fetchOneTrack(userId, pool, skip, ctx) {
+  const excluded = getAllExcluded(ctx.interacted, pool, skip);
+  const total    = ctx.total;
 
   if (total < COLD_START_THRESHOLD) {
     return tag(await strategyChart(userId, excluded, pool), 'exploit');
@@ -1037,7 +1088,7 @@ async function fetchOneTrack(userId, pool, skip) {
   // path is what breaks a streak; random alone can go a long time without
   // firing.
   const overdue = pool.sinceExplore >= EXPLORE_EVERY;
-  if (overdue || Math.random() < effectiveEpsilon(db.getUserPreferences(userId))) {
+  if (overdue || Math.random() < effectiveEpsilon(ctx.prefs)) {
     const t = await strategyExplore(userId, excluded, pool).catch(e => { if (e.isQuota) throw e; return null; });
     if (t) {
       pool.sinceExplore = 0;
@@ -1079,10 +1130,15 @@ async function refillPool(userId, pool) {
 
   const skip = new Set(); // diversity-rejected tracks, this refill only
   let skips = 0;
+  const ctx = {
+    total: db.countInteractions(userId),
+    prefs: db.getUserPreferences(userId),
+    interacted: db.getSeenTrackIds(userId),
+  };
 
   while (pool.tracks.length < POOL_TARGET) {
     try {
-      const track = await fetchOneTrack(userId, pool, skip);
+      const track = await fetchOneTrack(userId, pool, skip, ctx);
       if (!track) break; // no more unique tracks available right now
 
       if (pool.ids.has(track.id)) continue;
@@ -1129,8 +1185,13 @@ async function serveFromPool(profileUserId, pool) {
   }
 
   const skip = new Set();
+  const ctx = {
+    total: db.countInteractions(profileUserId),
+    prefs: db.getUserPreferences(profileUserId),
+    interacted: db.getSeenTrackIds(profileUserId),
+  };
   for (let attempt = 0; attempt <= MAX_DIVERSITY_SKIPS; attempt++) {
-    const track = await fetchOneTrack(profileUserId, pool, skip);
+    const track = await fetchOneTrack(profileUserId, pool, skip, ctx);
     if (!track) return null;
     if (attempt < MAX_DIVERSITY_SKIPS && violatesDiversity(pool, track)) {
       skip.add(track.id);
