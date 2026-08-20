@@ -1,5 +1,6 @@
 import db from '../db.js';
 import { getChart, searchTracks, getAlbum, getArtistTop, getTrackRadio, getRelatedArtists } from './deezer.js';
+import { trackMetaCache, affinityCache } from './cache.js';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -454,6 +455,27 @@ function artistScore(artistMap, artist_id) {
   return s !== undefined ? s : 0.5;
 }
 
+// Bulk per-user fetch backing genreScore/artistScore above. Checks the L2
+// Redis cache first (see cache.js / ARCHITECTURE.md); on a miss, falls back
+// to one SQLite query per score type (already O(1) per call, not per
+// candidate — db.getGenreScores/getArtistScores already return every row
+// for the user in one query) and populates the cache for next time.
+async function buildAffinityMaps(userId) {
+  let genreRows = await affinityCache.getGenreScores(userId);
+  if (!genreRows) {
+    genreRows = db.getGenreScores(userId);
+    affinityCache.setGenreScores(userId, genreRows);
+  }
+  let artistRows = await affinityCache.getArtistScores(userId);
+  if (!artistRows) {
+    artistRows = db.getArtistScores(userId);
+    affinityCache.setArtistScores(userId, artistRows);
+  }
+  return {
+    genreMap: new Map(genreRows.map(r => [r.genre_id, r.score])),
+    artistMap: new Map(artistRows.map(r => [r.artist_id, r.score])),
+  };
+}
 // Takes the preference rather than the userId: resolving it here meant running
 // a JOIN aggregate over the user's entire like history once per candidate, up
 // to 100 times per call. It's hoisted to the top of pickBest now.
@@ -759,7 +781,7 @@ async function buildScoreCtx(userId) {
   return {
     durPref: db.getDurationPreference(userId),
     weights: effectiveWeights(db.getUserPreferences(userId)),
-    affinity: buildAffinityMapsSync(userId),
+    affinity: await buildAffinityMaps(userId),
   };
 }
 
@@ -769,10 +791,16 @@ async function pickBest(userId, candidates, excluded, pool, opts = {}) {
   const all = candidates.filter(t => t.preview && !excluded.has(t.id));
   if (all.length === 0) return null;
 
-  // Resolved once for the whole batch rather than per candidate — one
-  // batched SQL query instead of one db.getTrack call per candidate.
+  // Resolved once for the whole batch rather than per candidate — L1
+  // in-process cache first (see cache.js), then one batched SQL query for
+  // whatever's still missing, instead of one db.getTrack call per candidate.
   const trackIds = all.map(t => t.id);
-  const cached = db.getTracksByIds(trackIds);
+  const { hits: cached, missing } = trackMetaCache.getMany(trackIds);
+  if (missing.length > 0) {
+    const fetched = db.getTracksByIds(missing);
+    trackMetaCache.setMany(fetched);
+    for (const [id, row] of fetched) cached.set(id, row);
+  }
 
   // Burnout caps are applied here, before the top-N slice and before the winner
   // gets enriched — so a capped artist costs nothing, where the post-fetch guard
@@ -791,7 +819,7 @@ async function pickBest(userId, candidates, excluded, pool, opts = {}) {
   const pctOf   = popPercentiles(eligible, rankOf);
   const durPref = scoreCtx?.durPref ?? db.getDurationPreference(userId);
   const weights = scoreCtx?.weights ?? effectiveWeights(db.getUserPreferences(userId));
-  const { genreMap, artistMap } = scoreCtx?.affinity ?? buildAffinityMapsSync(userId);
+  const { genreMap, artistMap } = scoreCtx?.affinity ?? await buildAffinityMaps(userId);
 
   const scored = eligible.map(t => {
     let s;
@@ -833,6 +861,7 @@ async function pickBest(userId, candidates, excluded, pool, opts = {}) {
   const enriched  = await enrichWithGenre(chosen);
   const track     = normalizeTrack(enriched, enriched.genre_id, enriched.genre_name);
   db.upsertTrack(track);
+  trackMetaCache.set(track.id, track);
   return track;
 }
 
@@ -958,13 +987,11 @@ function tag(track, via) {
   return track;
 }
 
-// Shared bulk-fetch backing genreScore/artistScore in pickBest,
-// reRankAndServe, and buildScoreCtx alike — two SQLite queries per call
-// (db.getGenreScores/getArtistScores already return every row for the user
-// in one query) in place of the one-query-per-candidate pattern this
-// replaces. Deliberately synchronous: reRankAndServe is on the hot re-rank
-// path that a long stretch of the test suite and scripts/simulate.js call
-// directly and treat as synchronous.
+// Deliberately synchronous, unlike pickBest's buildAffinityMaps — this is
+// on the hot re-rank path that a long stretch of the test suite and
+// scripts/simulate.js call directly and treat as synchronous (no Redis hop
+// here, just the same two bulk SQLite queries pickBest uses, in place of
+// the one-query-per-track pattern this replaces).
 function buildAffinityMapsSync(userId) {
   return {
     genreMap: new Map(db.getGenreScores(userId).map(r => [r.genre_id, r.score])),
@@ -1251,4 +1278,8 @@ export function updateAffinityScores(userId, track_id) {
     const { likes, rejects } = db.getArtistInteractionCounts(userId, track.artist_id);
     db.upsertArtistScore(userId, track.artist_id, track.artist_name, likes, rejects);
   }
+  // Fire-and-forget: this function stays synchronous (existing callers don't
+  // await it), and a cache-invalidation failure is non-fatal — the L2 entry
+  // just expires on its own via TTL (see cache.js).
+  affinityCache.invalidate(userId).catch(() => {});
 }
